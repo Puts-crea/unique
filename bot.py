@@ -43,9 +43,47 @@ FILE_SERVER_URL = os.getenv(
 
 MAX_FILE_MB = 50
 
-ALLOWED_USERS = set()
-
 TMP_DIR = tempfile.gettempdir()
+
+
+# =========================================================
+# ALLOWED USERS
+# =========================================================
+
+def load_allowed_users() -> set[int]:
+    raw = os.getenv("ALLOWED_USERS", "").strip()
+
+    if not raw:
+        return set()
+
+    result = set()
+
+    for item in raw.split(","):
+        item = item.strip()
+
+        if not item:
+            continue
+
+        try:
+            result.add(int(item))
+        except ValueError:
+            print(
+                f"WARNING: invalid ALLOWED_USERS value: {item}"
+            )
+
+    return result
+
+
+ALLOWED_USERS = load_allowed_users()
+
+
+def is_allowed(user_id: int) -> bool:
+    # Якщо змінна порожня — доступ відкритий усім.
+    # Коли додамо ID — доступ буде тільки whitelist.
+    if not ALLOWED_USERS:
+        return True
+
+    return user_id in ALLOWED_USERS
 
 
 # =========================================================
@@ -96,12 +134,6 @@ processing_users = set()
 # ДОПОМІЖНІ ФУНКЦІЇ
 # =========================================================
 
-def is_allowed(user_id: int) -> bool:
-    if not ALLOWED_USERS:
-        return True
-    return user_id in ALLOWED_USERS
-
-
 def remove_file(path: str | None):
     if not path:
         return
@@ -138,6 +170,14 @@ def get_extension(
     )
 
     return suffix or default
+
+
+async def access_denied(message: Message):
+    await message.answer(
+        "⛔ <b>Доступ до бота обмежений.</b>\n\n"
+        "Надішли адміністратору свій Telegram ID:\n"
+        f"<code>{message.from_user.id}</code>"
+    )
 
 
 # =========================================================
@@ -423,6 +463,20 @@ def image_pixel_mode(
 
 
 # =========================================================
+# /ID
+# ПРАЦЮЄ ДЛЯ ВСІХ
+# =========================================================
+
+@dp.message(Command("id"))
+async def cmd_id(message: Message):
+
+    await message.answer(
+        f"🆔 <b>Твій Telegram ID:</b>\n"
+        f"<code>{message.from_user.id}</code>"
+    )
+
+
+# =========================================================
 # /START
 # =========================================================
 
@@ -432,28 +486,13 @@ async def cmd_start(message: Message):
     if not is_allowed(
         message.from_user.id
     ):
-        await message.answer(
-            "⛔ Доступ заборонено."
-        )
+        await access_denied(message)
         return
 
     await message.answer(
         "👋 <b>Унікалізатор готовий</b>\n\n"
         "Надсилай відео або фото.\n"
         "Чекаю на твої файли 👇"
-    )
-
-
-# =========================================================
-# /ID
-# =========================================================
-
-@dp.message(Command("id"))
-async def cmd_id(message: Message):
-
-    await message.answer(
-        f"🆔 <b>Твій Telegram ID:</b>\n"
-        f"<code>{message.from_user.id}</code>"
     )
 
 
@@ -471,9 +510,7 @@ async def on_media(message: Message):
     if not is_allowed(
         message.from_user.id
     ):
-        await message.answer(
-            "⛔ Доступ заборонено."
-        )
+        await access_denied(message)
         return
 
     uid = message.from_user.id
@@ -708,6 +745,16 @@ async def process_video(
 
     await callback.answer()
 
+    if not is_allowed(uid):
+
+        await callback.message.edit_text(
+            "⛔ <b>Доступ до бота обмежений.</b>\n\n"
+            "Твій Telegram ID:\n"
+            f"<code>{uid}</code>"
+        )
+
+        return
+
     if uid in processing_users:
 
         await callback.answer(
@@ -912,6 +959,16 @@ async def process_image(
 
     await callback.answer()
 
+    if not is_allowed(uid):
+
+        await callback.message.edit_text(
+            "⛔ <b>Доступ до бота обмежений.</b>\n\n"
+            "Твій Telegram ID:\n"
+            f"<code>{uid}</code>"
+        )
+
+        return
+
     if uid in processing_users:
 
         await callback.answer(
@@ -1028,6 +1085,7 @@ async def unsupported(
     if not is_allowed(
         message.from_user.id
     ):
+        await access_denied(message)
         return
 
     await message.answer(
@@ -1057,6 +1115,10 @@ async def main():
     )
     print(
         f"Max file: {MAX_FILE_MB} MB"
+    )
+    print(
+        f"Allowed users: "
+        f"{len(ALLOWED_USERS) if ALLOWED_USERS else 'ALL'}"
     )
     print(
         f"Telegram API: {TELEGRAM_API_URL}"
