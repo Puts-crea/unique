@@ -13,7 +13,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -362,9 +362,7 @@ def image_pixel_mode(
                 if img.mode == "RGBA":
 
                     r, g, b, a = pixel
-
                     rgb = [r, g, b]
-
                     channel = random.randrange(3)
 
                     rgb[channel] = max(
@@ -386,9 +384,7 @@ def image_pixel_mode(
                 else:
 
                     r, g, b = pixel
-
                     rgb = [r, g, b]
-
                     channel = random.randrange(3)
 
                     rgb[channel] = max(
@@ -452,7 +448,7 @@ async def cmd_start(message: Message):
 # /ID
 # =========================================================
 
-@dp.message(F.text == "/id")
+@dp.message(Command("id"))
 async def cmd_id(message: Message):
 
     await message.answer(
