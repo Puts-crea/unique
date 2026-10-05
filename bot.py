@@ -4,6 +4,9 @@ import random
 import tempfile
 import uuid
 from pathlib import Path
+from urllib.parse import quote
+
+import aiohttp
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -28,38 +31,36 @@ from PIL import Image, ImageOps
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# Адреса нашого власного Telegram Bot API.
-# На Railway потім поставимо:
-# http://telegram-api.railway.internal:8081
 TELEGRAM_API_URL = os.getenv(
     "TELEGRAM_API_URL",
     "https://api.telegram.org",
 ).rstrip("/")
 
-# Максимальний розмір вхідного файлу
+FILE_SERVER_URL = os.getenv(
+    "FILE_SERVER_URL",
+    "http://telegram-bot-api.railway.internal:8090",
+).rstrip("/")
+
 MAX_FILE_MB = 50
 
-# Якщо порожньо — ботом можуть користуватися всі.
 ALLOWED_USERS = set()
-
-# Наприклад:
-# ALLOWED_USERS = {123456789}
 
 TMP_DIR = tempfile.gettempdir()
 
 
 # =========================================================
-# TELEGRAM BOT
+# TELEGRAM
 # =========================================================
 
 if TELEGRAM_API_URL != "https://api.telegram.org":
+
     telegram_api = TelegramAPIServer.from_base(
         TELEGRAM_API_URL
     )
 
     session = AiohttpSession(
         api=telegram_api,
-        timeout=300,
+        timeout=600,
     )
 
     bot = Bot(
@@ -70,12 +71,8 @@ if TELEGRAM_API_URL != "https://api.telegram.org":
         ),
     )
 
-    print(
-        f"Використовується власний Telegram API: "
-        f"{TELEGRAM_API_URL}"
-    )
-
 else:
+
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(
@@ -83,30 +80,15 @@ else:
         ),
     )
 
-    print("Використовується стандартний Telegram API")
-
 
 dp = Dispatcher()
 
 
 # =========================================================
-# ТИМЧАСОВА ПАМ'ЯТЬ
+# ПАМ'ЯТЬ
 # =========================================================
 
-# Тут зберігаємо інформацію про останній файл користувача.
-#
-# Формат:
-#
-# user_files[user_id] = {
-#     "path": "/tmp/...",
-#     "type": "video" або "image",
-#     "original_name": "video.mp4"
-# }
-
 user_files = {}
-
-# Щоб користувач випадково не запустив одну й ту саму
-# обробку кілька разів одночасно.
 processing_users = set()
 
 
@@ -117,13 +99,10 @@ processing_users = set()
 def is_allowed(user_id: int) -> bool:
     if not ALLOWED_USERS:
         return True
-
     return user_id in ALLOWED_USERS
 
 
 def remove_file(path: str | None):
-    """Безпечно видаляє тимчасовий файл."""
-
     if not path:
         return
 
@@ -135,8 +114,6 @@ def remove_file(path: str | None):
 
 
 def cleanup_user_file(user_id: int):
-    """Видаляє попередній файл користувача."""
-
     data = user_files.get(user_id)
 
     if data:
@@ -145,29 +122,124 @@ def cleanup_user_file(user_id: int):
     user_files.pop(user_id, None)
 
 
-def get_extension(filename: str | None, default: str) -> str:
-    """Отримує розширення файлу."""
+def get_extension(
+    filename: str | None,
+    default: str,
+) -> str:
 
     if not filename:
         return default
 
-    suffix = Path(filename).suffix.lower().replace(".", "")
+    suffix = (
+        Path(filename)
+        .suffix
+        .lower()
+        .replace(".", "")
+    )
 
-    if not suffix:
-        return default
-
-    return suffix
+    return suffix or default
 
 
-async def run_ffmpeg(args: list[str]) -> tuple[bool, str]:
-    """
-    Запускає FFmpeg.
+# =========================================================
+# DOWNLOAD ЧЕРЕЗ LOCAL TELEGRAM BOT API
+# =========================================================
 
-    Повертає:
-    True, "ok"
-    або
-    False, текст помилки
-    """
+async def download_telegram_file(
+    file_obj,
+    destination: str,
+):
+
+    telegram_file = await bot.get_file(
+        file_obj.file_id
+    )
+
+    file_path = telegram_file.file_path
+
+    if not file_path:
+        raise RuntimeError(
+            "Telegram не повернув file_path."
+        )
+
+    print(f"Telegram file_path: {file_path}")
+
+    # Якщо local Bot API повернув абсолютний шлях
+    if os.path.isabs(file_path):
+
+        root = "/var/lib/telegram-bot-api/"
+
+        if not file_path.startswith(root):
+            raise RuntimeError(
+                "Отримано невідомий абсолютний шлях: "
+                f"{file_path}"
+            )
+
+        relative_path = file_path[len(root):]
+
+        safe_path = quote(
+            relative_path,
+            safe="/",
+        )
+
+        download_url = (
+            f"{FILE_SERVER_URL}/{safe_path}"
+        )
+
+        print(
+            f"Downloading through file server: "
+            f"{download_url}"
+        )
+
+        timeout = aiohttp.ClientTimeout(
+            total=900,
+            connect=60,
+        )
+
+        async with aiohttp.ClientSession(
+            timeout=timeout
+        ) as client:
+
+            async with client.get(
+                download_url
+            ) as response:
+
+                if response.status != 200:
+
+                    text = await response.text()
+
+                    raise RuntimeError(
+                        "File server error: "
+                        f"HTTP {response.status}: "
+                        f"{text[:300]}"
+                    )
+
+                with open(
+                    destination,
+                    "wb",
+                ) as output:
+
+                    async for chunk in (
+                        response.content.iter_chunked(
+                            1024 * 1024
+                        )
+                    ):
+                        output.write(chunk)
+
+        return
+
+    # Fallback для стандартного Bot API
+    await bot.download_file(
+        file_path,
+        destination=destination,
+    )
+
+
+# =========================================================
+# FFMPEG
+# =========================================================
+
+async def run_ffmpeg(
+    args: list[str]
+) -> tuple[bool, str]:
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -178,46 +250,40 @@ async def run_ffmpeg(args: list[str]) -> tuple[bool, str]:
             stderr=asyncio.subprocess.PIPE,
         )
 
-        stdout, stderr = await proc.communicate()
+        _stdout, stderr = await proc.communicate()
 
         if proc.returncode != 0:
-            error_text = stderr.decode(
+            text = stderr.decode(
                 errors="ignore"
             )
 
-            return False, error_text[-1500:]
+            return False, text[-2000:]
 
         return True, "ok"
 
     except FileNotFoundError:
-        return (
-            False,
-            "FFmpeg не встановлено на сервері."
-        )
+        return False, "FFmpeg не встановлено."
 
     except Exception as e:
         return False, str(e)
 
 
 # =========================================================
-# ОБРОБКА ЗОБРАЖЕНЬ
+# IMAGE METADATA
 # =========================================================
 
 def image_metadata_mode(
     input_path: str,
     output_path: str,
 ) -> tuple[bool, str]:
-    """
-    Перезаписує картинку без старих EXIF/metadata.
-
-    Саме зображення візуально не змінюється.
-    """
 
     try:
         with Image.open(input_path) as source:
-            img = ImageOps.exif_transpose(source)
 
-            # Якщо є прозорість — PNG.
+            img = ImageOps.exif_transpose(
+                source
+            )
+
             has_alpha = (
                 img.mode in ("RGBA", "LA")
                 or "transparency" in img.info
@@ -249,20 +315,21 @@ def image_metadata_mode(
         return False, str(e)
 
 
+# =========================================================
+# IMAGE PIXELS
+# =========================================================
+
 def image_pixel_mode(
     input_path: str,
     output_path: str,
 ) -> tuple[bool, str]:
-    """
-    Вносить дуже маленькі зміни в окремі пікселі.
-
-    Зміни +/- 1 у кольоровому каналі практично
-    непомітні оку.
-    """
 
     try:
         with Image.open(input_path) as source:
-            img = ImageOps.exif_transpose(source)
+
+            img = ImageOps.exif_transpose(
+                source
+            )
 
             has_alpha = (
                 img.mode in ("RGBA", "LA")
@@ -277,17 +344,14 @@ def image_pixel_mode(
             pixels = img.load()
 
             width, height = img.size
-
             total_pixels = width * height
 
-            # Приблизно 1 змінений піксель на кожні 500.
-            # Але не більше 20 000 змін.
             changes = max(
-                300,
+                500,
                 min(
-                    20000,
-                    total_pixels // 500
-                )
+                    25000,
+                    total_pixels // 400,
+                ),
             )
 
             for _ in range(changes):
@@ -298,19 +362,20 @@ def image_pixel_mode(
                 pixel = pixels[x, y]
 
                 if img.mode == "RGBA":
+
                     r, g, b, a = pixel
 
-                    channel = random.randint(0, 2)
-
                     rgb = [r, g, b]
+
+                    channel = random.randrange(3)
 
                     rgb[channel] = max(
                         0,
                         min(
                             255,
                             rgb[channel]
-                            + random.choice((-1, 1))
-                        )
+                            + random.choice((-1, 1)),
+                        ),
                     )
 
                     pixels[x, y] = (
@@ -321,24 +386,26 @@ def image_pixel_mode(
                     )
 
                 else:
+
                     r, g, b = pixel
 
-                    channel = random.randint(0, 2)
-
                     rgb = [r, g, b]
+
+                    channel = random.randrange(3)
 
                     rgb[channel] = max(
                         0,
                         min(
                             255,
                             rgb[channel]
-                            + random.choice((-1, 1))
-                        )
+                            + random.choice((-1, 1)),
+                        ),
                     )
 
                     pixels[x, y] = tuple(rgb)
 
             if has_alpha:
+
                 img.save(
                     output_path,
                     format="PNG",
@@ -346,6 +413,7 @@ def image_pixel_mode(
                 )
 
             else:
+
                 img.save(
                     output_path,
                     format="JPEG",
@@ -361,13 +429,15 @@ def image_pixel_mode(
 
 
 # =========================================================
-# START
+# /START
 # =========================================================
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
 
-    if not is_allowed(message.from_user.id):
+    if not is_allowed(
+        message.from_user.id
+    ):
         await message.answer(
             "⛔ Доступ заборонено."
         )
@@ -375,16 +445,12 @@ async def cmd_start(message: Message):
 
     await message.answer(
         "👋 <b>Унікалізатор медіа</b>\n\n"
-
         "Надішли мені:\n\n"
-
         "🎬 <b>Відео</b> — до 50 МБ\n"
         "🖼 <b>Фото</b> — JPG, PNG, WEBP\n\n"
-
-        "Для відео доступно:\n"
+        "Для відео:\n"
         "⚡ швидка зміна без перекодування\n"
         "🎞 легка зміна відеопотоку\n\n"
-
         "Для зображень:\n"
         "📝 очищення метаданих\n"
         "🖼 мінімальна зміна пікселів"
@@ -392,13 +458,19 @@ async def cmd_start(message: Message):
 
 
 # =========================================================
-# ПРИЙОМ ФАЙЛІВ
+# ПРИЙОМ MEDIA
 # =========================================================
 
-@dp.message(F.video | F.photo | F.document)
+@dp.message(
+    F.video |
+    F.photo |
+    F.document
+)
 async def on_media(message: Message):
 
-    if not is_allowed(message.from_user.id):
+    if not is_allowed(
+        message.from_user.id
+    ):
         await message.answer(
             "⛔ Доступ заборонено."
         )
@@ -410,10 +482,6 @@ async def on_media(message: Message):
     media_type = None
     original_name = None
     extension = None
-
-    # -----------------------------------------------------
-    # VIDEO
-    # -----------------------------------------------------
 
     if message.video:
 
@@ -430,24 +498,12 @@ async def on_media(message: Message):
             "mp4",
         )
 
-    # -----------------------------------------------------
-    # PHOTO
-    # -----------------------------------------------------
-
     elif message.photo:
 
-        # Telegram надсилає декілька розмірів фото.
-        # [-1] — найбільший.
         file_obj = message.photo[-1]
-
         media_type = "image"
-
         original_name = "image.jpg"
         extension = "jpg"
-
-    # -----------------------------------------------------
-    # DOCUMENT
-    # -----------------------------------------------------
 
     elif message.document:
 
@@ -468,24 +524,16 @@ async def on_media(message: Message):
             "",
         )
 
-        # Відео як document
         if mime.startswith("video/"):
 
             media_type = "video"
+            extension = extension or "mp4"
 
-            if not extension:
-                extension = "mp4"
-
-        # Фото як document
         elif mime.startswith("image/"):
 
             media_type = "image"
+            extension = extension or "jpg"
 
-            if not extension:
-                extension = "jpg"
-
-        # Деякі Telegram-клієнти можуть
-        # не передати MIME правильно.
         elif extension in {
             "mp4",
             "mov",
@@ -494,7 +542,6 @@ async def on_media(message: Message):
             "avi",
             "mkv",
         }:
-
             media_type = "video"
 
         elif extension in {
@@ -503,24 +550,17 @@ async def on_media(message: Message):
             "png",
             "webp",
         }:
-
             media_type = "image"
 
         else:
-
             await message.answer(
-                "❌ Цей тип файлу не підтримується.\n\n"
-                "Надішли відео або JPG / PNG / WEBP."
+                "❌ Підтримуються тільки "
+                "відео та зображення."
             )
-
             return
 
     if not file_obj:
         return
-
-    # -----------------------------------------------------
-    # ПЕРЕВІРКА РОЗМІРУ
-    # -----------------------------------------------------
 
     if file_obj.file_size:
 
@@ -539,14 +579,12 @@ async def on_media(message: Message):
             )
 
             await message.answer(
-                f"❌ Файл завеликий.\n\n"
+                "❌ Файл завеликий.\n\n"
                 f"Розмір: {size_mb:.1f} МБ\n"
                 f"Максимум: {MAX_FILE_MB} МБ."
             )
-
             return
 
-    # Видаляємо попередній файл цього користувача.
     cleanup_user_file(uid)
 
     unique_id = uuid.uuid4().hex
@@ -560,41 +598,45 @@ async def on_media(message: Message):
         "⏳ Завантажую файл..."
     )
 
-    # -----------------------------------------------------
-    # DOWNLOAD
-    # -----------------------------------------------------
-
     try:
-
-        await bot.download(
+        await download_telegram_file(
             file_obj,
-            destination=local_path,
+            local_path,
         )
 
     except Exception as e:
+
+        remove_file(local_path)
 
         await status.edit_text(
             "❌ <b>Помилка завантаження</b>\n\n"
             f"<code>{str(e)}</code>"
         )
-
-        remove_file(local_path)
-
         return
 
-    # -----------------------------------------------------
-    # ЗАПАМ'ЯТОВУЄМО ФАЙЛ
-    # -----------------------------------------------------
+    if not os.path.exists(local_path):
+
+        await status.edit_text(
+            "❌ Файл не був завантажений."
+        )
+        return
+
+    downloaded_size = (
+        os.path.getsize(local_path)
+        / 1024
+        / 1024
+    )
+
+    print(
+        f"Downloaded: "
+        f"{downloaded_size:.2f} MB"
+    )
 
     user_files[uid] = {
         "path": local_path,
         "type": media_type,
         "original_name": original_name,
     }
-
-    # -----------------------------------------------------
-    # КНОПКИ ДЛЯ ВІДЕО
-    # -----------------------------------------------------
 
     if media_type == "video":
 
@@ -617,19 +659,10 @@ async def on_media(message: Message):
 
         await status.edit_text(
             "✅ <b>Відео отримано.</b>\n\n"
-            "Обери спосіб обробки:\n\n"
-
-            "⚡ <b>Швидкий</b> — змінює контейнер "
-            "і метадані без перекодування.\n\n"
-
-            "🎞 <b>Легка зміна</b> — перекодовує "
-            "відео та додає дуже слабкий шум.",
+            f"Розмір: {downloaded_size:.1f} МБ\n\n"
+            "Обери спосіб обробки:",
             reply_markup=kb,
         )
-
-    # -----------------------------------------------------
-    # КНОПКИ ДЛЯ ФОТО
-    # -----------------------------------------------------
 
     else:
 
@@ -652,19 +685,13 @@ async def on_media(message: Message):
 
         await status.edit_text(
             "✅ <b>Зображення отримано.</b>\n\n"
-            "Обери спосіб обробки:\n\n"
-
-            "📝 <b>Метадані</b> — перезаписує "
-            "файл без старих EXIF.\n\n"
-
-            "🖼 <b>Пікселі</b> — додатково "
-            "вносить мінімальні непомітні зміни.",
+            "Обери спосіб обробки:",
             reply_markup=kb,
         )
 
 
 # =========================================================
-# ОБРОБКА ВІДЕО
+# VIDEO PROCESSING
 # =========================================================
 
 @dp.callback_query(
@@ -687,7 +714,6 @@ async def process_video(
             "Файл уже обробляється.",
             show_alert=True,
         )
-
         return
 
     data = user_files.get(uid)
@@ -695,31 +721,19 @@ async def process_video(
     if not data:
 
         await callback.message.edit_text(
-            "❌ Файл загубився.\n"
-            "Надішли відео ще раз."
+            "❌ Файл загубився. "
+            "Надішли його ще раз."
         )
-
-        return
-
-    if data.get("type") != "video":
-
-        await callback.message.edit_text(
-            "❌ Це не відеофайл."
-        )
-
         return
 
     local_path = data["path"]
 
     if not os.path.exists(local_path):
 
-        user_files.pop(uid, None)
-
         await callback.message.edit_text(
-            "❌ Тимчасовий файл уже видалений.\n"
-            "Надішли відео ще раз."
+            "❌ Тимчасовий файл "
+            "вже видалений."
         )
-
         return
 
     processing_users.add(uid)
@@ -744,7 +758,10 @@ async def process_video(
                 local_path,
 
                 "-map",
-                "0",
+                "0:v:0",
+
+                "-map",
+                "0:a?",
 
                 "-c",
                 "copy",
@@ -768,7 +785,7 @@ async def process_video(
 
             await callback.message.edit_text(
                 "🎞 Перекодовую відео...\n\n"
-                "Цей режим працює довше."
+                "Це може зайняти деякий час."
             )
 
             unique = uuid.uuid4().hex
@@ -776,6 +793,12 @@ async def process_video(
             args = [
                 "-i",
                 local_path,
+
+                "-map",
+                "0:v:0",
+
+                "-map",
+                "0:a?",
 
                 "-vf",
                 "noise=alls=2:allf=t+u",
@@ -810,7 +833,9 @@ async def process_video(
                 out_path,
             ]
 
-        ok, error = await run_ffmpeg(args)
+        ok, error = await run_ffmpeg(
+            args
+        )
 
         if not ok:
 
@@ -818,7 +843,6 @@ async def process_video(
                 "❌ <b>FFmpeg помилка</b>\n\n"
                 f"<code>{error}</code>"
             )
-
             return
 
         if not os.path.exists(out_path):
@@ -826,7 +850,6 @@ async def process_video(
             await callback.message.edit_text(
                 "❌ FFmpeg не створив файл."
             )
-
             return
 
         size_mb = (
@@ -836,13 +859,16 @@ async def process_video(
         )
 
         await callback.message.edit_text(
-            f"📤 Відправляю готове відео...\n"
+            "📤 Відправляю готове відео...\n\n"
             f"Розмір: {size_mb:.1f} МБ"
         )
 
         output_file = FSInputFile(
             out_path,
-            filename=f"unique_{uuid.uuid4().hex[:8]}.mp4",
+            filename=(
+                f"unique_"
+                f"{uuid.uuid4().hex[:8]}.mp4"
+            ),
         )
 
         await callback.message.answer_video(
@@ -865,12 +891,11 @@ async def process_video(
     finally:
 
         remove_file(out_path)
-
         processing_users.discard(uid)
 
 
 # =========================================================
-# ОБРОБКА ЗОБРАЖЕНЬ
+# IMAGE PROCESSING
 # =========================================================
 
 @dp.callback_query(
@@ -893,7 +918,6 @@ async def process_image(
             "Файл уже обробляється.",
             show_alert=True,
         )
-
         return
 
     data = user_files.get(uid)
@@ -901,69 +925,35 @@ async def process_image(
     if not data:
 
         await callback.message.edit_text(
-            "❌ Файл загубився.\n"
-            "Надішли зображення ще раз."
+            "❌ Файл загубився."
         )
-
-        return
-
-    if data.get("type") != "image":
-
-        await callback.message.edit_text(
-            "❌ Це не зображення."
-        )
-
         return
 
     local_path = data["path"]
 
-    if not os.path.exists(local_path):
-
-        user_files.pop(uid, None)
-
-        await callback.message.edit_text(
-            "❌ Тимчасовий файл уже видалений."
-        )
-
-        return
-
     processing_users.add(uid)
 
-    # Перевіряємо, чи є прозорість.
+    out_path = None
+
     try:
 
-        with Image.open(local_path) as check_img:
+        with Image.open(local_path) as img:
 
             has_alpha = (
-                check_img.mode in ("RGBA", "LA")
-                or "transparency" in check_img.info
+                img.mode in ("RGBA", "LA")
+                or "transparency" in img.info
             )
 
-    except Exception as e:
-
-        processing_users.discard(uid)
-
-        await callback.message.edit_text(
-            "❌ Не вдалося відкрити зображення.\n\n"
-            f"<code>{str(e)}</code>"
+        output_extension = (
+            "png"
+            if has_alpha
+            else "jpg"
         )
 
-        return
-
-    if has_alpha:
-
-        output_extension = "png"
-
-    else:
-
-        output_extension = "jpg"
-
-    out_path = os.path.join(
-        TMP_DIR,
-        f"image_{uid}_{uuid.uuid4().hex}.{output_extension}"
-    )
-
-    try:
+        out_path = os.path.join(
+            TMP_DIR,
+            f"image_{uid}_{uuid.uuid4().hex}.{output_extension}"
+        )
 
         await callback.message.edit_text(
             "🖼 Обробляю зображення..."
@@ -988,29 +978,17 @@ async def process_image(
         if not ok:
 
             await callback.message.edit_text(
-                "❌ <b>Помилка обробки фото</b>\n\n"
+                "❌ Помилка:\n\n"
                 f"<code>{error}</code>"
             )
-
             return
-
-        if not os.path.exists(out_path):
-
-            await callback.message.edit_text(
-                "❌ Зображення не було створено."
-            )
-
-            return
-
-        # Відправляємо як document,
-        # щоб Telegram повторно не стискав картинку.
 
         output_file = FSInputFile(
             out_path,
             filename=(
                 f"unique_"
-                f"{uuid.uuid4().hex[:8]}."
-                f"{output_extension}"
+                f"{uuid.uuid4().hex[:8]}"
+                f".{output_extension}"
             ),
         )
 
@@ -1032,52 +1010,71 @@ async def process_image(
 
     finally:
 
-        remove_file(out_path)
+        if out_path:
+            remove_file(out_path)
 
         processing_users.discard(uid)
 
 
 # =========================================================
-# НЕПІДТРИМУВАНІ ПОВІДОМЛЕННЯ
+# OTHER
 # =========================================================
 
 @dp.message()
-async def unsupported(message: Message):
+async def unsupported(
+    message: Message
+):
 
-    if not is_allowed(message.from_user.id):
+    if not is_allowed(
+        message.from_user.id
+    ):
         return
 
     await message.answer(
-        "Надішли мені відео або зображення.\n\n"
+        "Надішли мені відео або фото.\n\n"
         "🎬 Відео — до 50 МБ\n"
         "🖼 JPG / PNG / WEBP"
     )
 
 
 # =========================================================
-# ЗАПУСК
+# START
 # =========================================================
 
 async def main():
 
     if not BOT_TOKEN:
-
         raise SystemExit(
-            "❌ BOT_TOKEN не встановлений."
+            "BOT_TOKEN не встановлений."
         )
 
-    print("====================================")
+    print(
+        "===================================="
+    )
     print("MEDIA UNIQUE BOT")
-    print("====================================")
-    print(f"Max file: {MAX_FILE_MB} MB")
-    print(f"Telegram API: {TELEGRAM_API_URL}")
-    print("====================================")
+    print(
+        "===================================="
+    )
+    print(
+        f"Max file: {MAX_FILE_MB} MB"
+    )
+    print(
+        f"Telegram API: {TELEGRAM_API_URL}"
+    )
+    print(
+        f"File server: {FILE_SERVER_URL}"
+    )
+    print(
+        "===================================="
+    )
 
     try:
 
         await dp.start_polling(
             bot,
-            allowed_updates=dp.resolve_used_update_types(),
+            allowed_updates=(
+                dp.resolve_used_update_types()
+            ),
         )
 
     finally:
