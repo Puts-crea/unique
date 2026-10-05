@@ -8,10 +8,9 @@ echo "========================================"
 
 echo "Starting internal file server on port 8090..."
 
-busybox httpd \
-    -f \
-    -p 8090 \
-    -h /var/lib/telegram-bot-api &
+python3 -m http.server 8090 \
+  --directory /var/lib/telegram-bot-api \
+  --bind :: &
 
 echo "File server started."
 
