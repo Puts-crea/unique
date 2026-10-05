@@ -162,7 +162,6 @@ async def download_telegram_file(
 
     print(f"Telegram file_path: {file_path}")
 
-    # Якщо local Bot API повернув абсолютний шлях
     if os.path.isabs(file_path):
 
         root = "/var/lib/telegram-bot-api/"
@@ -226,7 +225,6 @@ async def download_telegram_file(
 
         return
 
-    # Fallback для стандартного Bot API
     await bot.download_file(
         file_path,
         destination=destination,
@@ -447,6 +445,19 @@ async def cmd_start(message: Message):
         "👋 <b>Унікалізатор готовий</b>\n\n"
         "Надсилай відео або фото.\n"
         "Чекаю на твої файли 👇"
+    )
+
+
+# =========================================================
+# /ID
+# =========================================================
+
+@dp.message(F.text == "/id")
+async def cmd_id(message: Message):
+
+    await message.answer(
+        f"🆔 <b>Твій Telegram ID:</b>\n"
+        f"<code>{message.from_user.id}</code>"
     )
 
 
