@@ -1,21 +1,19 @@
-import os
-import io
-import json
-import time
-import uuid
-import shlex
-import shutil
-import random
 import asyncio
+import os
+import random
 import tempfile
-import subprocess
+import uuid
 from pathlib import Path
-from typing import Optional
+from urllib.parse import quote
 
 import aiohttp
-from PIL import Image
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -23,524 +21,472 @@ from aiogram.types import (
     InlineKeyboardButton,
     FSInputFile,
 )
-from aiogram.filters import Command, CommandStart
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.client.telegram import TelegramAPIServer
+
+from PIL import Image, ImageOps
 
 
-# =========================
-# ENV
-# =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-TELEGRAM_API_URL = os.getenv("TELEGRAM_API_URL", "").strip()
-FILE_SERVER_URL = os.getenv("FILE_SERVER_URL", "").strip()
+# =========================================================
+# НАЛАШТУВАННЯ
+# =========================================================
 
-# список айді через кому: 12345,67890
-ALLOWED_USERS_RAW = os.getenv("ALLOWED_USERS", "").strip()
-ALLOWED_USERS = {
-    int(x.strip())
-    for x in ALLOWED_USERS_RAW.split(",")
-    if x.strip().isdigit()
-}
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-MAX_FILE_SIZE_MB = 50
-MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
-PENDING_TTL = 60 * 60  # 1 година
+TELEGRAM_API_URL = os.getenv(
+    "TELEGRAM_API_URL",
+    "https://api.telegram.org",
+).rstrip("/")
 
+FILE_SERVER_URL = os.getenv(
+    "FILE_SERVER_URL",
+    "http://telegram-bot-api.railway.internal:8090",
+).rstrip("/")
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
+MAX_FILE_MB = 50
+
+TMP_DIR = tempfile.gettempdir()
 
 
-# =========================
-# BOT / DP
-# =========================
-if TELEGRAM_API_URL:
-    api = TelegramAPIServer.from_base(TELEGRAM_API_URL, is_local=True)
-    session = AiohttpSession(api=api)
-    bot = Bot(
-        token=BOT_TOKEN,
-        session=session,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-else:
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
+# =========================================================
+# ALLOWED USERS
+# =========================================================
 
-dp = Dispatcher()
+def load_allowed_users() -> set[int]:
+    raw = os.getenv("ALLOWED_USERS", "").strip()
 
-# task_id -> data
-PENDING_TASKS = {}
+    if not raw:
+        return set()
+
+    result = set()
+
+    for item in raw.split(","):
+        item = item.strip()
+
+        if not item:
+            continue
+
+        try:
+            result.add(int(item))
+        except ValueError:
+            print(
+                f"WARNING: invalid ALLOWED_USERS value: {item}"
+            )
+
+    return result
 
 
-# =========================
-# HELPERS
-# =========================
-def user_allowed(user_id: int) -> bool:
+ALLOWED_USERS = load_allowed_users()
+
+
+def is_allowed(user_id: int) -> bool:
+    # Якщо змінна порожня — доступ відкритий усім.
+    # Коли додамо ID — доступ буде тільки whitelist.
     if not ALLOWED_USERS:
         return True
+
     return user_id in ALLOWED_USERS
 
 
-def safe_unlink(path: str | Path):
+# =========================================================
+# TELEGRAM
+# =========================================================
+
+if TELEGRAM_API_URL != "https://api.telegram.org":
+
+    telegram_api = TelegramAPIServer.from_base(
+        TELEGRAM_API_URL
+    )
+
+    session = AiohttpSession(
+        api=telegram_api,
+        timeout=600,
+    )
+
+    bot = Bot(
+        token=BOT_TOKEN,
+        session=session,
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML
+        ),
+    )
+
+else:
+
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML
+        ),
+    )
+
+
+dp = Dispatcher()
+
+
+# =========================================================
+# ПАМ'ЯТЬ
+# =========================================================
+
+user_files = {}
+processing_users = set()
+
+
+# =========================================================
+# ДОПОМІЖНІ ФУНКЦІЇ
+# =========================================================
+
+def remove_file(path: str | None):
+    if not path:
+        return
+
     try:
-        Path(path).unlink(missing_ok=True)
-    except Exception:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
         pass
 
 
-def safe_rmtree(path: str | Path):
-    try:
-        shutil.rmtree(path, ignore_errors=True)
-    except Exception:
-        pass
+def cleanup_user_file(user_id: int):
+    data = user_files.get(user_id)
+
+    if data:
+        remove_file(data.get("path"))
+
+    user_files.pop(user_id, None)
 
 
-def cleanup_pending():
-    now = time.time()
-    to_delete = []
-    for task_id, data in PENDING_TASKS.items():
-        if now - data["created_at"] > PENDING_TTL:
-            safe_rmtree(data["tmpdir"])
-            to_delete.append(task_id)
-    for task_id in to_delete:
-        PENDING_TASKS.pop(task_id, None)
+def get_extension(
+    filename: str | None,
+    default: str,
+) -> str:
 
-
-def get_ext(filename: Optional[str], default_ext: str) -> str:
     if not filename:
-        return default_ext
-    ext = Path(filename).suffix.lower()
-    return ext if ext else default_ext
+        return default
+
+    suffix = (
+        Path(filename)
+        .suffix
+        .lower()
+        .replace(".", "")
+    )
+
+    return suffix or default
 
 
-def is_video_document(message: Message) -> bool:
-    if not message.document:
-        return False
-    mime = (message.document.mime_type or "").lower()
-    name = (message.document.file_name or "").lower()
-    video_exts = {
-        ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".mpeg", ".mpg"
-    }
-    return mime.startswith("video/") or Path(name).suffix.lower() in video_exts
-
-
-def is_image_document(message: Message) -> bool:
-    if not message.document:
-        return False
-    mime = (message.document.mime_type or "").lower()
-    name = (message.document.file_name or "").lower()
-    image_exts = {".jpg", ".jpeg", ".png", ".webp"}
-    return mime.startswith("image/") or Path(name).suffix.lower() in image_exts
-
-
-def video_kb(task_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⚡ Швидко", callback_data=f"proc|vf|{task_id}"
-                ),
-                InlineKeyboardButton(
-                    text="🎞 Глибше", callback_data=f"proc|vd|{task_id}"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🖼 Preview blur", callback_data=f"proc|vb|{task_id}"
-                )
-            ],
-        ]
+async def access_denied(message: Message):
+    await message.answer(
+        "⛔ <b>Доступ до бота обмежений.</b>\n\n"
+        "Надішли адміністратору свій Telegram ID:\n"
+        f"<code>{message.from_user.id}</code>"
     )
 
 
-def image_kb(task_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📝 Метадані", callback_data=f"proc|im|{task_id}"
-                ),
-                InlineKeyboardButton(
-                    text="🖼 Пікселі", callback_data=f"proc|ip|{task_id}"
-                ),
-            ]
-        ]
+# =========================================================
+# DOWNLOAD ЧЕРЕЗ LOCAL TELEGRAM BOT API
+# =========================================================
+
+async def download_telegram_file(
+    file_obj,
+    destination: str,
+):
+
+    telegram_file = await bot.get_file(
+        file_obj.file_id
     )
 
+    file_path = telegram_file.file_path
 
-async def run_command(cmd: list[str]) -> tuple[int, str, str]:
-    def _run():
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
+    if not file_path:
+        raise RuntimeError(
+            "Telegram не повернув file_path."
         )
-        return result.returncode, result.stdout, result.stderr
 
-    return await asyncio.to_thread(_run)
+    print(f"Telegram file_path: {file_path}")
 
+    if os.path.isabs(file_path):
 
-async def download_file_via_http(url: str, dst_path: str):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=120) as resp:
-            resp.raise_for_status()
-            with open(dst_path, "wb") as f:
-                async for chunk in resp.content.iter_chunked(1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
+        root = "/var/lib/telegram-bot-api/"
 
+        if not file_path.startswith(root):
+            raise RuntimeError(
+                "Отримано невідомий абсолютний шлях: "
+                f"{file_path}"
+            )
 
-async def download_telegram_file(file_id: str, dst_path: str):
-    tg_file = await bot.get_file(file_id)
+        relative_path = file_path[len(root):]
 
-    # 1) пробуємо стандартний download
-    try:
-        await bot.download(tg_file, destination=dst_path)
+        safe_path = quote(
+            relative_path,
+            safe="/",
+        )
+
+        download_url = (
+            f"{FILE_SERVER_URL}/{safe_path}"
+        )
+
+        print(
+            f"Downloading through file server: "
+            f"{download_url}"
+        )
+
+        timeout = aiohttp.ClientTimeout(
+            total=900,
+            connect=60,
+        )
+
+        async with aiohttp.ClientSession(
+            timeout=timeout
+        ) as client:
+
+            async with client.get(
+                download_url
+            ) as response:
+
+                if response.status != 200:
+
+                    text = await response.text()
+
+                    raise RuntimeError(
+                        "File server error: "
+                        f"HTTP {response.status}: "
+                        f"{text[:300]}"
+                    )
+
+                with open(
+                    destination,
+                    "wb",
+                ) as output:
+
+                    async for chunk in (
+                        response.content.iter_chunked(
+                            1024 * 1024
+                        )
+                    ):
+                        output.write(chunk)
+
         return
-    except Exception:
-        pass
 
-    # 2) fallback через FILE_SERVER_URL
-    if FILE_SERVER_URL and tg_file.file_path:
-        url = f"{FILE_SERVER_URL.rstrip('/')}/{tg_file.file_path.lstrip('/')}"
-        await download_file_via_http(url, dst_path)
-        return
-
-    raise RuntimeError("Не вдалося завантажити файл")
-
-
-def clamp(val: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, val))
-
-
-def parse_fps(fps_str: str) -> float:
-    if not fps_str:
-        return 30.0
-    if "/" in fps_str:
-        a, b = fps_str.split("/", 1)
-        try:
-            a = float(a)
-            b = float(b)
-            if b != 0:
-                return a / b
-        except Exception:
-            return 30.0
-    try:
-        return float(fps_str)
-    except Exception:
-        return 30.0
-
-
-async def probe_video(video_path: str) -> dict:
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,r_frame_rate",
-        "-of", "json",
-        video_path,
-    ]
-    code, out, err = await run_command(cmd)
-    if code != 0:
-        raise RuntimeError(f"ffprobe error: {err}")
-
-    data = json.loads(out)
-    streams = data.get("streams", [])
-    if not streams:
-        raise RuntimeError("Не знайдено відеопотік")
-
-    st = streams[0]
-    width = int(st.get("width", 1080))
-    height = int(st.get("height", 1920))
-    fps = parse_fps(st.get("r_frame_rate", "30/1"))
-    if fps <= 0 or fps > 120:
-        fps = 30.0
-
-    return {"width": width, "height": height, "fps": fps}
-
-
-# =========================
-# IMAGE PROCESSING
-# =========================
-async def process_image_metadata_only(input_path: str, output_path: str):
-    def _work():
-        with Image.open(input_path) as img:
-            fmt = (img.format or "").upper()
-            if fmt not in {"JPEG", "PNG", "WEBP"}:
-                fmt = "PNG"
-
-            save_kwargs = {}
-            out_img = img.copy()
-
-            if fmt == "JPEG":
-                if out_img.mode in ("RGBA", "LA", "P"):
-                    out_img = out_img.convert("RGB")
-                save_kwargs.update(quality=95, optimize=True)
-            elif fmt == "PNG":
-                save_kwargs.update(optimize=True)
-            elif fmt == "WEBP":
-                if out_img.mode not in ("RGB", "RGBA"):
-                    out_img = out_img.convert("RGBA")
-                save_kwargs.update(quality=95, method=6)
-
-            out_img.save(output_path, format=fmt, **save_kwargs)
-
-    await asyncio.to_thread(_work)
-
-
-async def process_image_pixels(input_path: str, output_path: str):
-    def _work():
-        with Image.open(input_path) as img:
-            fmt = (img.format or "").upper()
-            if fmt not in {"JPEG", "PNG", "WEBP"}:
-                fmt = "PNG"
-
-            out_img = img.copy()
-            if out_img.mode not in ("RGB", "RGBA"):
-                if fmt == "JPEG":
-                    out_img = out_img.convert("RGB")
-                else:
-                    out_img = out_img.convert("RGBA")
-
-            pixels = out_img.load()
-            width, height = out_img.size
-
-            # дуже дрібні зміни
-            changes = max(10, min(50, (width * height) // 200000))
-            for _ in range(changes):
-                x = random.randint(0, width - 1)
-                y = random.randint(0, height - 1)
-                px = pixels[x, y]
-
-                if isinstance(px, int):
-                    pixels[x, y] = clamp(px + random.choice([-1, 1]), 0, 255)
-                else:
-                    vals = list(px)
-                    channels = min(3, len(vals))
-                    ch = random.randint(0, channels - 1)
-                    vals[ch] = clamp(vals[ch] + random.choice([-1, 1]), 0, 255)
-                    pixels[x, y] = tuple(vals)
-
-            save_kwargs = {}
-            if fmt == "JPEG":
-                if out_img.mode in ("RGBA", "LA", "P"):
-                    out_img = out_img.convert("RGB")
-                save_kwargs.update(quality=95, optimize=True)
-            elif fmt == "PNG":
-                save_kwargs.update(optimize=True)
-            elif fmt == "WEBP":
-                save_kwargs.update(quality=95, method=6)
-
-            out_img.save(output_path, format=fmt, **save_kwargs)
-
-    await asyncio.to_thread(_work)
-
-
-# =========================
-# VIDEO PROCESSING
-# =========================
-async def process_video_fast(input_path: str, output_path: str):
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i", input_path,
-        "-map", "0",
-        "-c", "copy",
-        "-map_metadata", "-1",
-        "-movflags", "+faststart",
-        output_path,
-    ]
-    code, out, err = await run_command(cmd)
-    if code != 0:
-        raise RuntimeError(f"ffmpeg fast error:\n{err}")
-
-
-async def process_video_deep(input_path: str, output_path: str):
-    vf = (
-        "scale=trunc(iw/2)*2:trunc(ih/2)*2,"
-        "eq=contrast=1.001:brightness=0.001:saturation=1.002,"
-        "noise=alls=2:allf=t+u"
+    await bot.download_file(
+        file_path,
+        destination=destination,
     )
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i", input_path,
-        "-vf", vf,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-map_metadata", "-1",
-        "-movflags", "+faststart",
-        output_path,
-    ]
-    code, out, err = await run_command(cmd)
-    if code != 0:
-        raise RuntimeError(f"ffmpeg deep error:\n{err}")
 
 
-async def process_video_preview_blur(input_path: str, output_path: str, workdir: str):
-    info = await probe_video(input_path)
-    width = info["width"]
-    height = info["height"]
-    fps = info["fps"]
+# =========================================================
+# FFMPEG
+# =========================================================
 
-    first_frame = str(Path(workdir) / "first_frame.png")
-    intro_video = str(Path(workdir) / "intro.mp4")
+async def run_ffmpeg(
+    args: list[str]
+) -> tuple[bool, str]:
 
-    # 1 кадр з першого фрейму + сильне розмиття
-    extract_cmd = [
-        "ffmpeg",
-        "-y",
-        "-i", input_path,
-        "-vf", "select=eq(n\\,0),boxblur=100:1,gblur=sigma=100",
-        "-frames:v", "1",
-        first_frame,
-    ]
-    code, out, err = await run_command(extract_cmd)
-    if code != 0:
-        raise RuntimeError(f"extract first frame error:\n{err}")
-
-    # робимо 1-frame intro відео
-    intro_duration = 1.0 / fps
-    intro_cmd = [
-        "ffmpeg",
-        "-y",
-        "-loop", "1",
-        "-i", first_frame,
-        "-t", f"{intro_duration:.6f}",
-        "-r", f"{fps:.6f}",
-        "-vf", f"scale={width}:{height},format=yuv420p",
-        "-an",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        intro_video,
-    ]
-    code, out, err = await run_command(intro_cmd)
-    if code != 0:
-        raise RuntimeError(f"intro video error:\n{err}")
-
-    # склеюємо blurred intro + оригінальне відео
-    # аудіо беремо з оригіналу без змін
-    concat_cmd = [
-        "ffmpeg",
-        "-y",
-        "-i", intro_video,
-        "-i", input_path,
-        "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
-        "-map", "[v]",
-        "-map", "1:a?",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "18",
-        "-c:a", "copy",
-        "-map_metadata", "-1",
-        "-movflags", "+faststart",
-        output_path,
-    ]
-    code, out, err = await run_command(concat_cmd)
-
-    # якщо copy аудіо не злетіло — fallback у AAC
-    if code != 0:
-        concat_cmd_fallback = [
+    try:
+        proc = await asyncio.create_subprocess_exec(
             "ffmpeg",
             "-y",
-            "-i", intro_video,
-            "-i", input_path,
-            "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
-            "-map", "[v]",
-            "-map", "1:a?",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "18",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-map_metadata", "-1",
-            "-movflags", "+faststart",
-            output_path,
-        ]
-        code, out, err = await run_command(concat_cmd_fallback)
-        if code != 0:
-            raise RuntimeError(f"preview blur concat error:\n{err}")
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        _stdout, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            text = stderr.decode(
+                errors="ignore"
+            )
+
+            return False, text[-2000:]
+
+        return True, "ok"
+
+    except FileNotFoundError:
+        return False, "FFmpeg не встановлено."
+
+    except Exception as e:
+        return False, str(e)
 
 
-# =========================
-# TASK CREATION
-# =========================
-async def create_task_from_video(message: Message, file_id: str, original_name: str, file_size: int):
-    if file_size > MAX_FILE_SIZE:
-        await message.answer(f"❌ Максимальний розмір відео — {MAX_FILE_SIZE_MB} МБ.")
-        return
+# =========================================================
+# IMAGE METADATA
+# =========================================================
 
-    cleanup_pending()
+def image_metadata_mode(
+    input_path: str,
+    output_path: str,
+) -> tuple[bool, str]:
 
-    task_id = uuid.uuid4().hex
-    tmpdir = tempfile.mkdtemp(prefix="uniqbot_")
-    ext = get_ext(original_name, ".mp4")
-    input_path = str(Path(tmpdir) / f"input{ext}")
+    try:
+        with Image.open(input_path) as source:
 
-    await download_telegram_file(file_id, input_path)
+            img = ImageOps.exif_transpose(
+                source
+            )
 
-    PENDING_TASKS[task_id] = {
-        "type": "video",
-        "tmpdir": tmpdir,
-        "input_path": input_path,
-        "original_name": original_name or f"video{ext}",
-        "created_at": time.time(),
-        "user_id": message.from_user.id,
-    }
+            has_alpha = (
+                img.mode in ("RGBA", "LA")
+                or "transparency" in img.info
+            )
+
+            if has_alpha:
+                img = img.convert("RGBA")
+
+                img.save(
+                    output_path,
+                    format="PNG",
+                    optimize=True,
+                )
+
+            else:
+                img = img.convert("RGB")
+
+                img.save(
+                    output_path,
+                    format="JPEG",
+                    quality=96,
+                    optimize=True,
+                    progressive=True,
+                )
+
+        return True, "ok"
+
+    except Exception as e:
+        return False, str(e)
+
+
+# =========================================================
+# IMAGE PIXELS
+# =========================================================
+
+def image_pixel_mode(
+    input_path: str,
+    output_path: str,
+) -> tuple[bool, str]:
+
+    try:
+        with Image.open(input_path) as source:
+
+            img = ImageOps.exif_transpose(
+                source
+            )
+
+            has_alpha = (
+                img.mode in ("RGBA", "LA")
+                or "transparency" in img.info
+            )
+
+            if has_alpha:
+                img = img.convert("RGBA")
+            else:
+                img = img.convert("RGB")
+
+            pixels = img.load()
+
+            width, height = img.size
+            total_pixels = width * height
+
+            changes = max(
+                500,
+                min(
+                    25000,
+                    total_pixels // 400,
+                ),
+            )
+
+            for _ in range(changes):
+
+                x = random.randrange(width)
+                y = random.randrange(height)
+
+                pixel = pixels[x, y]
+
+                if img.mode == "RGBA":
+
+                    r, g, b, a = pixel
+                    rgb = [r, g, b]
+                    channel = random.randrange(3)
+
+                    rgb[channel] = max(
+                        0,
+                        min(
+                            255,
+                            rgb[channel]
+                            + random.choice((-1, 1)),
+                        ),
+                    )
+
+                    pixels[x, y] = (
+                        rgb[0],
+                        rgb[1],
+                        rgb[2],
+                        a,
+                    )
+
+                else:
+
+                    r, g, b = pixel
+                    rgb = [r, g, b]
+                    channel = random.randrange(3)
+
+                    rgb[channel] = max(
+                        0,
+                        min(
+                            255,
+                            rgb[channel]
+                            + random.choice((-1, 1)),
+                        ),
+                    )
+
+                    pixels[x, y] = tuple(rgb)
+
+            if has_alpha:
+
+                img.save(
+                    output_path,
+                    format="PNG",
+                    optimize=True,
+                )
+
+            else:
+
+                img.save(
+                    output_path,
+                    format="JPEG",
+                    quality=96,
+                    optimize=True,
+                    progressive=True,
+                )
+
+        return True, "ok"
+
+    except Exception as e:
+        return False, str(e)
+
+
+# =========================================================
+# /ID
+# ПРАЦЮЄ ДЛЯ ВСІХ
+# =========================================================
+
+@dp.message(Command("id"))
+async def cmd_id(message: Message):
 
     await message.answer(
-        "Обери режим для відео:",
-        reply_markup=video_kb(task_id),
+        f"🆔 <b>Твій Telegram ID:</b>\n"
+        f"<code>{message.from_user.id}</code>"
     )
 
 
-async def create_task_from_image(message: Message, file_id: str, original_name: str, file_size: int):
-    if file_size > MAX_FILE_SIZE:
-        await message.answer(f"❌ Максимальний розмір зображення — {MAX_FILE_SIZE_MB} МБ.")
-        return
+# =========================================================
+# /START
+# =========================================================
 
-    cleanup_pending()
-
-    task_id = uuid.uuid4().hex
-    tmpdir = tempfile.mkdtemp(prefix="uniqbot_")
-    ext = get_ext(original_name, ".jpg")
-    input_path = str(Path(tmpdir) / f"input{ext}")
-
-    await download_telegram_file(file_id, input_path)
-
-    PENDING_TASKS[task_id] = {
-        "type": "image",
-        "tmpdir": tmpdir,
-        "input_path": input_path,
-        "original_name": original_name or f"image{ext}",
-        "created_at": time.time(),
-        "user_id": message.from_user.id,
-    }
-
-    await message.answer(
-        "Обери режим для зображення:",
-        reply_markup=image_kb(task_id),
-    )
-
-
-# =========================
-# COMMANDS
-# =========================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    if ALLOWED_USERS and not user_allowed(message.from_user.id):
-        await message.answer(
-            "👋 Надішли мені свій <b>/id</b> адміну для доступу."
-        )
+
+    if not is_allowed(
+        message.from_user.id
+    ):
+        await access_denied(message)
         return
 
     await message.answer(
@@ -550,188 +496,722 @@ async def cmd_start(message: Message):
     )
 
 
-@dp.message(Command("id"))
-async def cmd_id(message: Message):
-    await message.answer(
-        f"🆔 <b>Твій Telegram ID:</b>\n<code>{message.from_user.id}</code>"
-    )
+# =========================================================
+# ПРИЙОМ MEDIA
+# =========================================================
 
+@dp.message(
+    F.video |
+    F.photo |
+    F.document
+)
+async def on_media(message: Message):
 
-# =========================
-# MEDIA HANDLERS
-# =========================
-@dp.message(F.video)
-async def handle_video(message: Message):
-    if not user_allowed(message.from_user.id):
-        await message.answer("⛔️ Немає доступу. Надішли /id адміну.")
+    if not is_allowed(
+        message.from_user.id
+    ):
+        await access_denied(message)
         return
 
-    await create_task_from_video(
-        message=message,
-        file_id=message.video.file_id,
-        original_name=message.video.file_name or "video.mp4",
-        file_size=message.video.file_size or 0,
-    )
+    uid = message.from_user.id
 
+    file_obj = None
+    media_type = None
+    original_name = None
+    extension = None
 
-@dp.message(F.photo)
-async def handle_photo(message: Message):
-    if not user_allowed(message.from_user.id):
-        await message.answer("⛔️ Немає доступу. Надішли /id адміну.")
-        return
+    if message.video:
 
-    largest = message.photo[-1]
-    await create_task_from_image(
-        message=message,
-        file_id=largest.file_id,
-        original_name="photo.jpg",
-        file_size=largest.file_size or 0,
-    )
+        file_obj = message.video
+        media_type = "video"
 
-
-@dp.message(F.document)
-async def handle_document(message: Message):
-    if not user_allowed(message.from_user.id):
-        await message.answer("⛔️ Немає доступу. Надішли /id адміну.")
-        return
-
-    if is_video_document(message):
-        await create_task_from_video(
-            message=message,
-            file_id=message.document.file_id,
-            original_name=message.document.file_name or "video.mp4",
-            file_size=message.document.file_size or 0,
+        original_name = (
+            message.video.file_name
+            or "video.mp4"
         )
-        return
 
-    if is_image_document(message):
-        await create_task_from_image(
-            message=message,
-            file_id=message.document.file_id,
-            original_name=message.document.file_name or "image.png",
-            file_size=message.document.file_size or 0,
+        extension = get_extension(
+            original_name,
+            "mp4",
         )
+
+    elif message.photo:
+
+        file_obj = message.photo[-1]
+        media_type = "image"
+        original_name = "image.jpg"
+        extension = "jpg"
+
+    elif message.document:
+
+        file_obj = message.document
+
+        mime = (
+            message.document.mime_type
+            or ""
+        ).lower()
+
+        original_name = (
+            message.document.file_name
+            or "file"
+        )
+
+        extension = get_extension(
+            original_name,
+            "",
+        )
+
+        if mime.startswith("video/"):
+
+            media_type = "video"
+            extension = extension or "mp4"
+
+        elif mime.startswith("image/"):
+
+            media_type = "image"
+            extension = extension or "jpg"
+
+        elif extension in {
+            "mp4",
+            "mov",
+            "m4v",
+            "webm",
+            "avi",
+            "mkv",
+        }:
+            media_type = "video"
+
+        elif extension in {
+            "jpg",
+            "jpeg",
+            "png",
+            "webp",
+        }:
+            media_type = "image"
+
+        else:
+            await message.answer(
+                "❌ Підтримуються тільки "
+                "відео та зображення."
+            )
+            return
+
+    if not file_obj:
         return
 
-    await message.answer(
-        "Надішли мені відео або фото.\n\n"
-        f"🎬 Відео — до {MAX_FILE_SIZE_MB} МБ\n"
-        "🖼 JPG / PNG / WEBP"
-    )
+    if file_obj.file_size:
 
+        max_bytes = (
+            MAX_FILE_MB
+            * 1024
+            * 1024
+        )
 
-@dp.message()
-async def fallback_handler(message: Message):
-    if message.text in ("/start", "/id"):
-        return
+        if file_obj.file_size > max_bytes:
 
-    await message.answer(
-        "Надішли мені відео або фото.\n\n"
-        f"🎬 Відео — до {MAX_FILE_SIZE_MB} МБ\n"
-        "🖼 JPG / PNG / WEBP"
-    )
-
-
-# =========================
-# CALLBACKS
-# =========================
-@dp.callback_query(F.data.startswith("proc|"))
-async def process_callback(callback: CallbackQuery):
-    try:
-        _, mode, task_id = callback.data.split("|", 2)
-    except Exception:
-        await callback.answer("Некоректна дія", show_alert=True)
-        return
-
-    task = PENDING_TASKS.get(task_id)
-    if not task:
-        await callback.answer("Задача вже протухла або не знайдена", show_alert=True)
-        return
-
-    if callback.from_user.id != task["user_id"]:
-        await callback.answer("Це не твоя задача", show_alert=True)
-        return
-
-    await callback.answer("Обробляю...")
-    status_msg = await callback.message.answer("⏳ Обробляю файл...")
-
-    tmpdir = task["tmpdir"]
-    input_path = task["input_path"]
-    original_name = task["original_name"]
-
-    try:
-        if task["type"] == "video":
-            output_path = str(Path(tmpdir) / "result.mp4")
-
-            if mode == "vf":
-                await process_video_fast(input_path, output_path)
-                out_name = f"unique_fast_{Path(original_name).stem}.mp4"
-
-            elif mode == "vd":
-                await process_video_deep(input_path, output_path)
-                out_name = f"unique_deep_{Path(original_name).stem}.mp4"
-
-            elif mode == "vb":
-                await process_video_preview_blur(input_path, output_path, tmpdir)
-                out_name = f"unique_preview_{Path(original_name).stem}.mp4"
-
-            else:
-                raise RuntimeError("Невідомий режим для відео")
-
-            await callback.message.answer_document(
-                document=FSInputFile(output_path, filename=out_name),
-                caption="✅ Готово",
+            size_mb = (
+                file_obj.file_size
+                / 1024
+                / 1024
             )
 
-        elif task["type"] == "image":
-            ext = Path(original_name).suffix.lower()
-            if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
-                ext = ".png"
+            await message.answer(
+                "❌ Файл завеликий.\n\n"
+                f"Розмір: {size_mb:.1f} МБ\n"
+                f"Максимум: {MAX_FILE_MB} МБ."
+            )
+            return
 
-            output_path = str(Path(tmpdir) / f"result{ext}")
+    cleanup_user_file(uid)
 
-            if mode == "im":
-                await process_image_metadata_only(input_path, output_path)
-                out_name = f"image_meta_{Path(original_name).stem}{ext}"
+    unique_id = uuid.uuid4().hex
 
-            elif mode == "ip":
-                await process_image_pixels(input_path, output_path)
-                out_name = f"image_pixels_{Path(original_name).stem}{ext}"
+    local_path = os.path.join(
+        TMP_DIR,
+        f"input_{uid}_{unique_id}.{extension}"
+    )
 
-            else:
-                raise RuntimeError("Невідомий режим для зображення")
+    status = await message.answer(
+        "⏳ Завантажую файл..."
+    )
 
-            await callback.message.answer_document(
-                document=FSInputFile(output_path, filename=out_name),
-                caption="✅ Готово",
+    try:
+        await download_telegram_file(
+            file_obj,
+            local_path,
+        )
+
+    except Exception as e:
+
+        remove_file(local_path)
+
+        await status.edit_text(
+            "❌ <b>Помилка завантаження</b>\n\n"
+            f"<code>{str(e)}</code>"
+        )
+        return
+
+    if not os.path.exists(local_path):
+
+        await status.edit_text(
+            "❌ Файл не був завантажений."
+        )
+        return
+
+    downloaded_size = (
+        os.path.getsize(local_path)
+        / 1024
+        / 1024
+    )
+
+    print(
+        f"Downloaded: "
+        f"{downloaded_size:.2f} MB"
+    )
+
+    user_files[uid] = {
+        "path": local_path,
+        "type": media_type,
+        "original_name": original_name,
+    }
+
+    if media_type == "video":
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⚡ Швидкий режим",
+                        callback_data="video_metadata",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🎞 Легка зміна відео",
+                        callback_data="video_noise",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🖼 Метадані + прев’ю",
+                        callback_data="video_preview",
+                    )
+                ],
+            ]
+        )
+
+        await status.edit_text(
+            "✅ <b>Відео отримано.</b>\n\n"
+            f"Розмір: {downloaded_size:.1f} МБ\n\n"
+            "Обери спосіб обробки:",
+            reply_markup=kb,
+        )
+
+    else:
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="📝 Очистити метадані",
+                        callback_data="image_metadata",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🖼 Змінити пікселі",
+                        callback_data="image_pixels",
+                    )
+                ],
+            ]
+        )
+
+        await status.edit_text(
+            "✅ <b>Зображення отримано.</b>\n\n"
+            "Обери спосіб обробки:",
+            reply_markup=kb,
+        )
+
+
+# =========================================================
+# VIDEO PROCESSING
+# =========================================================
+
+@dp.callback_query(
+    F.data.in_({
+        "video_metadata",
+        "video_noise",
+        "video_preview",
+    })
+)
+async def process_video(
+    callback: CallbackQuery
+):
+
+    uid = callback.from_user.id
+
+    await callback.answer()
+
+    if not is_allowed(uid):
+
+        await callback.message.edit_text(
+            "⛔ <b>Доступ до бота обмежений.</b>\n\n"
+            "Твій Telegram ID:\n"
+            f"<code>{uid}</code>"
+        )
+
+        return
+
+    if uid in processing_users:
+
+        await callback.answer(
+            "Файл уже обробляється.",
+            show_alert=True,
+        )
+        return
+
+    data = user_files.get(uid)
+
+    if not data:
+
+        await callback.message.edit_text(
+            "❌ Файл загубився. "
+            "Надішли його ще раз."
+        )
+        return
+
+    local_path = data["path"]
+
+    if not os.path.exists(local_path):
+
+        await callback.message.edit_text(
+            "❌ Тимчасовий файл "
+            "вже видалений."
+        )
+        return
+
+    processing_users.add(uid)
+
+    out_path = os.path.join(
+        TMP_DIR,
+        f"output_{uid}_{uuid.uuid4().hex}.mp4"
+    )
+
+    try:
+
+        if callback.data == "video_metadata":
+
+            await callback.message.edit_text(
+                "⚡ Обробляю відео..."
+            )
+
+            unique = uuid.uuid4().hex
+
+            args = [
+                "-i",
+                local_path,
+
+                "-map",
+                "0:v:0",
+
+                "-map",
+                "0:a?",
+
+                "-c",
+                "copy",
+
+                "-metadata",
+                f"title=Unique_{unique}",
+
+                "-metadata",
+                f"comment=ID_{unique}",
+
+                "-metadata",
+                f"description=Processed_{unique}",
+
+                "-movflags",
+                "+faststart",
+
+                out_path,
+            ]
+
+        elif callback.data == "video_noise":
+
+            await callback.message.edit_text(
+                "🎞 Перекодовую відео...\n\n"
+                "Це може зайняти деякий час."
+            )
+
+            unique = uuid.uuid4().hex
+
+            args = [
+                "-i",
+                local_path,
+
+                "-map",
+                "0:v:0",
+
+                "-map",
+                "0:a?",
+
+                "-vf",
+                "noise=alls=2:allf=t+u",
+
+                "-c:v",
+                "libx264",
+
+                "-preset",
+                "veryfast",
+
+                "-crf",
+                "23",
+
+                "-pix_fmt",
+                "yuv420p",
+
+                "-c:a",
+                "aac",
+
+                "-b:a",
+                "192k",
+
+                "-metadata",
+                f"title=Unique_{unique}",
+
+                "-metadata",
+                f"comment=ID_{unique}",
+
+                "-movflags",
+                "+faststart",
+
+                out_path,
+            ]
+
+        else:
+
+            await callback.message.edit_text(
+                "🖼 Створюю розмите прев’ю...\n\n"
+                "Додаю 1 розмитий кадр на початок."
+            )
+
+            unique = uuid.uuid4().hex
+
+            preview_filter = (
+                "tpad=start=1:start_mode=clone,"
+                "boxblur="
+                "luma_radius='min(100,min(w,h)/2-1)':"
+                "luma_power=1:"
+                "chroma_radius='min(100,min(cw,ch)/2-1)':"
+                "chroma_power=1:"
+                "enable='eq(n,0)',"
+                "gblur=sigma=100:enable='eq(n,0)'"
+            )
+
+            args = [
+                "-i",
+                local_path,
+
+                "-map",
+                "0:v:0",
+
+                "-map",
+                "0:a?",
+
+                "-vf",
+                preview_filter,
+
+                "-c:v",
+                "libx264",
+
+                "-preset",
+                "veryfast",
+
+                "-crf",
+                "18",
+
+                "-pix_fmt",
+                "yuv420p",
+
+                "-c:a",
+                "copy",
+
+                "-metadata",
+                f"title=Unique_{unique}",
+
+                "-metadata",
+                f"comment=Preview_{unique}",
+
+                "-metadata",
+                f"description=Processed_{unique}",
+
+                "-movflags",
+                "+faststart",
+
+                out_path,
+            ]
+
+        ok, error = await run_ffmpeg(
+            args
+        )
+
+        if not ok:
+
+            await callback.message.edit_text(
+                "❌ <b>FFmpeg помилка</b>\n\n"
+                f"<code>{error}</code>"
+            )
+            return
+
+        if not os.path.exists(out_path):
+
+            await callback.message.edit_text(
+                "❌ FFmpeg не створив файл."
+            )
+            return
+
+        size_mb = (
+            os.path.getsize(out_path)
+            / 1024
+            / 1024
+        )
+
+        await callback.message.edit_text(
+            "📤 Відправляю готове відео...\n\n"
+            f"Розмір: {size_mb:.1f} МБ"
+        )
+
+        output_file = FSInputFile(
+            out_path,
+            filename=(
+                f"unique_"
+                f"{uuid.uuid4().hex[:8]}.mp4"
+            ),
+        )
+
+        await callback.message.answer_video(
+            video=output_file,
+            caption="✅ <b>Готово!</b>",
+            supports_streaming=True,
+        )
+
+        await callback.message.delete()
+
+        cleanup_user_file(uid)
+
+    except Exception as e:
+
+        await callback.message.edit_text(
+            "❌ <b>Помилка обробки</b>\n\n"
+            f"<code>{str(e)}</code>"
+        )
+
+    finally:
+
+        remove_file(out_path)
+        processing_users.discard(uid)
+
+
+# =========================================================
+# IMAGE PROCESSING
+# =========================================================
+
+@dp.callback_query(
+    F.data.in_({
+        "image_metadata",
+        "image_pixels",
+    })
+)
+async def process_image(
+    callback: CallbackQuery
+):
+
+    uid = callback.from_user.id
+
+    await callback.answer()
+
+    if not is_allowed(uid):
+
+        await callback.message.edit_text(
+            "⛔ <b>Доступ до бота обмежений.</b>\n\n"
+            "Твій Telegram ID:\n"
+            f"<code>{uid}</code>"
+        )
+
+        return
+
+    if uid in processing_users:
+
+        await callback.answer(
+            "Файл уже обробляється.",
+            show_alert=True,
+        )
+        return
+
+    data = user_files.get(uid)
+
+    if not data:
+
+        await callback.message.edit_text(
+            "❌ Файл загубився."
+        )
+        return
+
+    local_path = data["path"]
+
+    processing_users.add(uid)
+
+    out_path = None
+
+    try:
+
+        with Image.open(local_path) as img:
+
+            has_alpha = (
+                img.mode in ("RGBA", "LA")
+                or "transparency" in img.info
+            )
+
+        output_extension = (
+            "png"
+            if has_alpha
+            else "jpg"
+        )
+
+        out_path = os.path.join(
+            TMP_DIR,
+            f"image_{uid}_{uuid.uuid4().hex}.{output_extension}"
+        )
+
+        await callback.message.edit_text(
+            "🖼 Обробляю зображення..."
+        )
+
+        if callback.data == "image_metadata":
+
+            ok, error = await asyncio.to_thread(
+                image_metadata_mode,
+                local_path,
+                out_path,
             )
 
         else:
-            raise RuntimeError("Невідомий тип задачі")
 
-        await status_msg.edit_text("✅ Готово")
+            ok, error = await asyncio.to_thread(
+                image_pixel_mode,
+                local_path,
+                out_path,
+            )
+
+        if not ok:
+
+            await callback.message.edit_text(
+                "❌ Помилка:\n\n"
+                f"<code>{error}</code>"
+            )
+            return
+
+        output_file = FSInputFile(
+            out_path,
+            filename=(
+                f"unique_"
+                f"{uuid.uuid4().hex[:8]}"
+                f".{output_extension}"
+            ),
+        )
+
+        await callback.message.answer_document(
+            document=output_file,
+            caption="✅ <b>Готово!</b>",
+        )
+
+        await callback.message.delete()
+
+        cleanup_user_file(uid)
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ Помилка:\n<code>{str(e)[:3500]}</code>")
+
+        await callback.message.edit_text(
+            "❌ <b>Помилка</b>\n\n"
+            f"<code>{str(e)}</code>"
+        )
 
     finally:
-        safe_rmtree(tmpdir)
-        PENDING_TASKS.pop(task_id, None)
+
+        if out_path:
+            remove_file(out_path)
+
+        processing_users.discard(uid)
 
 
-# =========================
-# MAIN
-# =========================
+# =========================================================
+# OTHER
+# =========================================================
+
+@dp.message()
+async def unsupported(
+    message: Message
+):
+
+    if not is_allowed(
+        message.from_user.id
+    ):
+        await access_denied(message)
+        return
+
+    await message.answer(
+        "Надішли мені відео або фото.\n\n"
+        "🎬 Відео — до 50 МБ\n"
+        "🖼 JPG / PNG / WEBP"
+    )
+
+
+# =========================================================
+# START
+# =========================================================
+
 async def main():
-    print("====================================")
-    print("MEDIA UNIQUE BOT")
-    print("====================================")
-    print(f"Max file: {MAX_FILE_SIZE_MB} MB")
-    print(f"Telegram API: {TELEGRAM_API_URL or 'https://api.telegram.org'}")
-    print(f"File server: {FILE_SERVER_URL or '-'}")
-    print("====================================")
 
-    await dp.start_polling(bot)
+    if not BOT_TOKEN:
+        raise SystemExit(
+            "BOT_TOKEN не встановлений."
+        )
+
+    print(
+        "===================================="
+    )
+    print("MEDIA UNIQUE BOT")
+    print(
+        "===================================="
+    )
+    print(
+        f"Max file: {MAX_FILE_MB} MB"
+    )
+    print(
+        f"Allowed users: "
+        f"{len(ALLOWED_USERS) if ALLOWED_USERS else 'ALL'}"
+    )
+    print(
+        f"Telegram API: {TELEGRAM_API_URL}"
+    )
+    print(
+        f"File server: {FILE_SERVER_URL}"
+    )
+    print(
+        "===================================="
+    )
+
+    try:
+
+        await dp.start_polling(
+            bot,
+            allowed_updates=(
+                dp.resolve_used_update_types()
+            ),
+        )
+
+    finally:
+
+        await bot.session.close()
 
 
 if __name__ == "__main__":
