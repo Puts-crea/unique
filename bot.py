@@ -77,6 +77,33 @@ def load_allowed_users() -> set[int]:
 ALLOWED_USERS = load_allowed_users()
 
 
+def load_admin_users() -> set[int]:
+    raw = os.getenv("ADMIN_USERS", "").strip()
+
+    if not raw:
+        return set()
+
+    result = set()
+
+    for item in raw.split(","):
+        item = item.strip()
+
+        if not item:
+            continue
+
+        try:
+            result.add(int(item))
+        except ValueError:
+            print(
+                f"WARNING: invalid ADMIN_USERS value: {item}"
+            )
+
+    return result
+
+
+ADMIN_USERS = load_admin_users()
+
+
 def is_allowed(user_id: int) -> bool:
     # Якщо змінна порожня — доступ відкритий усім.
     # Коли додамо ID — доступ буде тільки whitelist.
@@ -476,7 +503,7 @@ async def cmd_id(message: Message):
     )
 
 
-# =========================================================
+# =========================================================\n# /BROADCAST\n# ТІЛЬКИ ДЛЯ АДМІНІВ\n# =========================================================\n\n@dp.message(Command("broadcast"))\nasync def cmd_broadcast(message: Message):\n\n    uid = message.from_user.id\n\n    if uid not in ADMIN_USERS:\n        return\n\n    if not ALLOWED_USERS:\n        await message.answer(\n            "❌ ALLOWED_USERS порожній.\\n"\n            "Немає кому робити розсилку."\n        )\n        return\n\n    full_text = message.text or ""\n    parts = full_text.split(maxsplit=1)\n\n    if len(parts) < 2 or not parts[1].strip():\n        await message.answer(\n            "Напиши текст після команди.\\n\\n"\n            "Наприклад:\\n"\n            "<code>/broadcast Бот оновлено ✅</code>"\n        )\n        return\n\n    broadcast_text = parts[1].strip()\n\n    success = 0\n    failed = 0\n\n    status = await message.answer(\n        f"📤 Починаю розсилку для "\n        f"{len(ALLOWED_USERS)} користувачів..."\n    )\n\n    for user_id in ALLOWED_USERS:\n        try:\n            await bot.send_message(\n                chat_id=user_id,\n                text=broadcast_text,\n                parse_mode=None,\n            )\n            success += 1\n        except Exception as e:\n            failed += 1\n            print(\n                f"Broadcast error for {user_id}: {e}"\n            )\n\n        await asyncio.sleep(0.05)\n\n    await status.edit_text(\n        "✅ <b>Розсилка завершена</b>\\n\\n"\n        f"Успішно: <b>{success}</b>\\n"\n        f"Помилок: <b>{failed}</b>"\n    )\n\n\n# =========================================================
 # /START
 # =========================================================
 
@@ -1189,6 +1216,10 @@ async def main():
     print(
         f"Allowed users: "
         f"{len(ALLOWED_USERS) if ALLOWED_USERS else 'ALL'}"
+    )
+    print(
+        f"Admin users: "
+        f"{len(ADMIN_USERS)}"
     )
     print(
         f"Telegram API: {TELEGRAM_API_URL}"
