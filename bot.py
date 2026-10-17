@@ -3,6 +3,7 @@ import os
 import random
 import tempfile
 import uuid
+from collections import deque
 from pathlib import Path
 from urllib.parse import quote
 
@@ -42,16 +43,15 @@ FILE_SERVER_URL = os.getenv(
 ).rstrip("/")
 
 MAX_FILE_MB = 50
-
 TMP_DIR = tempfile.gettempdir()
 
 
 # =========================================================
-# ALLOWED USERS
+# ALLOWED USERS / ADMINS
 # =========================================================
 
-def load_allowed_users() -> set[int]:
-    raw = os.getenv("ALLOWED_USERS", "").strip()
+def load_id_set(env_name: str) -> set[int]:
+    raw = os.getenv(env_name, "").strip()
 
     if not raw:
         return set()
@@ -67,46 +67,17 @@ def load_allowed_users() -> set[int]:
         try:
             result.add(int(item))
         except ValueError:
-            print(
-                f"WARNING: invalid ALLOWED_USERS value: {item}"
-            )
+            print(f"WARNING: invalid {env_name} value: {item}")
 
     return result
 
 
-ALLOWED_USERS = load_allowed_users()
-
-
-def load_admin_users() -> set[int]:
-    raw = os.getenv("ADMIN_USERS", "").strip()
-
-    if not raw:
-        return set()
-
-    result = set()
-
-    for item in raw.split(","):
-        item = item.strip()
-
-        if not item:
-            continue
-
-        try:
-            result.add(int(item))
-        except ValueError:
-            print(
-                f"WARNING: invalid ADMIN_USERS value: {item}"
-            )
-
-    return result
-
-
-ADMIN_USERS = load_admin_users()
+ALLOWED_USERS = load_id_set("ALLOWED_USERS")
+ADMIN_USERS = load_id_set("ADMIN_USERS")
 
 
 def is_allowed(user_id: int) -> bool:
-    # Якщо змінна порожня — доступ відкритий усім.
-    # Коли додамо ID — доступ буде тільки whitelist.
+    # Порожній ALLOWED_USERS = доступ відкритий усім.
     if not ALLOWED_USERS:
         return True
 
@@ -150,11 +121,37 @@ dp = Dispatcher()
 
 
 # =========================================================
-# ПАМ'ЯТЬ
+# ЧЕРГИ
 # =========================================================
 
-user_files = {}
-processing_users = set()
+# Для кожного користувача своя черга.
+# Один користувач може накидати скільки завгодно файлів.
+# Вони будуть оброблятися строго по черзі.
+user_queues: dict[int, deque] = {}
+
+# Користувачі, в яких зараз реально працює FFmpeg/Pillow.
+processing_users: set[int] = set()
+
+
+def get_user_queue(user_id: int) -> deque:
+    if user_id not in user_queues:
+        user_queues[user_id] = deque()
+
+    return user_queues[user_id]
+
+
+def queue_position(user_id: int, item_id: str) -> int | None:
+    queue = get_user_queue(user_id)
+
+    for index, item in enumerate(queue, start=1):
+        if item["id"] == item_id:
+            return index
+
+    return None
+
+
+def queue_count(user_id: int) -> int:
+    return len(get_user_queue(user_id))
 
 
 # =========================================================
@@ -170,15 +167,6 @@ def remove_file(path: str | None):
             os.remove(path)
     except OSError:
         pass
-
-
-def cleanup_user_file(user_id: int):
-    data = user_files.get(user_id)
-
-    if data:
-        remove_file(data.get("path"))
-
-    user_files.pop(user_id, None)
 
 
 def get_extension(
@@ -322,7 +310,7 @@ async def run_ffmpeg(
                 errors="ignore"
             )
 
-            return False, text[-2000:]
+            return False, text[-2500:]
 
         return True, "ok"
 
@@ -490,6 +478,319 @@ def image_pixel_mode(
 
 
 # =========================================================
+# INLINE KEYBOARDS
+# =========================================================
+
+def video_mode_keyboard(item_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⚡ Швидкий режим",
+                    callback_data=f"vm|{item_id}|metadata",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎞 Легка зміна відео",
+                    callback_data=f"vm|{item_id}|noise",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🖼 Метадані + прев’ю",
+                    callback_data=f"vm|{item_id}|preview",
+                )
+            ],
+        ]
+    )
+
+
+def extension_keyboard(item_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Без подовження",
+                    callback_data=f"ve|{item_id}|0",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="+30 секунд",
+                    callback_data=f"ve|{item_id}|30",
+                ),
+                InlineKeyboardButton(
+                    text="+60 секунд",
+                    callback_data=f"ve|{item_id}|60",
+                ),
+            ],
+        ]
+    )
+
+
+def image_mode_keyboard(item_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📝 Очистити метадані",
+                    callback_data=f"im|{item_id}|metadata",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🖼 Змінити пікселі",
+                    callback_data=f"im|{item_id}|pixels",
+                )
+            ],
+        ]
+    )
+
+
+# =========================================================
+# РОБОТА З ЧЕРГОЮ
+# =========================================================
+
+def active_item(user_id: int):
+    queue = get_user_queue(user_id)
+    return queue[0] if queue else None
+
+
+def item_is_active(user_id: int, item_id: str) -> bool:
+    item = active_item(user_id)
+    return bool(item and item["id"] == item_id)
+
+
+async def show_next_item(user_id: int):
+    """Показує кнопки для першого файлу в черзі."""
+
+    if user_id in processing_users:
+        return
+
+    queue = get_user_queue(user_id)
+
+    if not queue:
+        return
+
+    item = queue[0]
+
+    # Якщо вже чекаємо вибір користувача — повторно не спамимо.
+    if item.get("status") not in {"waiting", "ready"}:
+        return
+
+    item["status"] = "choosing_mode"
+
+    total = len(queue)
+
+    if item["type"] == "video":
+        await bot.send_message(
+            chat_id=item["chat_id"],
+            text=(
+                "🎬 <b>Наступне відео готове до обробки.</b>\n\n"
+                f"📦 Файлів у черзі: <b>{total}</b>\n"
+                "Обери спосіб унікалізації:"
+            ),
+            reply_markup=video_mode_keyboard(item["id"]),
+        )
+
+    else:
+        await bot.send_message(
+            chat_id=item["chat_id"],
+            text=(
+                "🖼 <b>Наступне зображення готове до обробки.</b>\n\n"
+                f"📦 Файлів у черзі: <b>{total}</b>\n"
+                "Обери спосіб обробки:"
+            ),
+            reply_markup=image_mode_keyboard(item["id"]),
+        )
+
+
+async def finish_current_item(
+    user_id: int,
+    remove_input: bool = True,
+):
+    queue = get_user_queue(user_id)
+
+    if not queue:
+        processing_users.discard(user_id)
+        return
+
+    item = queue.popleft()
+
+    if remove_input:
+        remove_file(item.get("path"))
+
+    processing_users.discard(user_id)
+
+    if not queue:
+        user_queues.pop(user_id, None)
+        return
+
+    # Наступний файл запускаємо автоматично.
+    await show_next_item(user_id)
+
+
+# =========================================================
+# VIDEO PROCESSING BUILDERS
+# =========================================================
+
+def common_reencode_filter(extra_filters: list[str]) -> str:
+    filters = list(extra_filters)
+
+    # На всякий випадок робимо парні розміри для H.264/yuv420p.
+    filters.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+
+    return ",".join(filters)
+
+
+async def process_video_file(
+    input_path: str,
+    output_path: str,
+    mode: str,
+    extend_seconds: int,
+) -> tuple[bool, str]:
+
+    unique = uuid.uuid4().hex
+
+    # -----------------------------------------------------
+    # ШВИДКИЙ РЕЖИМ БЕЗ ПОДОВЖЕННЯ
+    # Тут можна залишити stream copy.
+    # -----------------------------------------------------
+    if mode == "metadata" and extend_seconds == 0:
+
+        args = [
+            "-i",
+            input_path,
+
+            "-map",
+            "0:v:0",
+
+            "-map",
+            "0:a?",
+
+            "-c",
+            "copy",
+
+            "-metadata",
+            f"title=Unique_{unique}",
+
+            "-metadata",
+            f"comment=ID_{unique}",
+
+            "-metadata",
+            f"description=Processed_{unique}",
+
+            "-movflags",
+            "+faststart",
+
+            output_path,
+        ]
+
+        return await run_ffmpeg(args)
+
+    # -----------------------------------------------------
+    # ВСІ ІНШІ ВАРІАНТИ ПОТРЕБУЮТЬ ВІДЕО-ФІЛЬТРА
+    # -----------------------------------------------------
+    filters: list[str] = []
+
+    if mode == "noise":
+        filters.append("noise=alls=2:allf=t+u")
+
+    elif mode == "preview":
+        # Додаємо рівно 1 копію першого кадру перед відео.
+        # Розмивається лише цей новий перший кадр.
+        filters.extend([
+            "tpad=start=1:start_mode=clone",
+            (
+                "boxblur="
+                "luma_radius='min(100,min(w,h)/2-1)':"
+                "luma_power=1:"
+                "chroma_radius='min(100,min(cw,ch)/2-1)':"
+                "chroma_power=1:"
+                "enable='eq(n,0)'"
+            ),
+            "gblur=sigma=100:enable='eq(n,0)'",
+        ])
+
+    elif mode != "metadata":
+        return False, "Невідомий режим відео."
+
+    if extend_seconds > 0:
+        # Останній кадр заморожується на +30/+60 секунд.
+        # Аудіодоріжку НЕ подовжуємо, тому додана частина тиха.
+        filters.append(
+            f"tpad=stop_mode=clone:stop_duration={extend_seconds}"
+        )
+
+    vf = common_reencode_filter(filters)
+
+    args = [
+        "-i",
+        input_path,
+
+        "-map",
+        "0:v:0",
+
+        "-map",
+        "0:a?",
+
+        "-vf",
+        vf,
+
+        "-c:v",
+        "libx264",
+
+        "-preset",
+        "veryfast",
+
+        "-crf",
+        "23" if mode == "noise" else "18",
+
+        "-pix_fmt",
+        "yuv420p",
+    ]
+
+    # Зберігаємо поведінку старих режимів:
+    # noise перекодовував аудіо в AAC;
+    # metadata/preview копіюють аудіо як є.
+    if mode == "noise":
+        args.extend([
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+        ])
+    else:
+        args.extend([
+            "-c:a",
+            "copy",
+        ])
+
+    args.extend([
+        "-metadata",
+        f"title=Unique_{unique}",
+
+        "-metadata",
+        (
+            f"comment=Preview_{unique}"
+            if mode == "preview"
+            else f"comment=ID_{unique}"
+        ),
+
+        "-metadata",
+        f"description=Processed_{unique}",
+
+        "-movflags",
+        "+faststart",
+
+        output_path,
+    ])
+
+    return await run_ffmpeg(args)
+
+
+# =========================================================
 # /ID
 # ПРАЦЮЄ ДЛЯ ВСІХ
 # =========================================================
@@ -552,6 +853,7 @@ async def cmd_broadcast(message: Message):
                 parse_mode=None,
             )
             success += 1
+
         except Exception as e:
             failed += 1
             print(
@@ -583,7 +885,8 @@ async def cmd_start(message: Message):
     await message.answer(
         "👋 <b>Унікалізатор готовий</b>\n\n"
         "Надсилай відео або фото.\n"
-        "Чекаю на твої файли 👇"
+        "Можеш накидати одразу кілька файлів — "
+        "вони підуть у чергу та обробляться по черзі. 👇"
     )
 
 
@@ -713,13 +1016,11 @@ async def on_media(message: Message):
             )
             return
 
-    cleanup_user_file(uid)
-
-    unique_id = uuid.uuid4().hex
+    item_id = uuid.uuid4().hex[:12]
 
     local_path = os.path.join(
         TMP_DIR,
-        f"input_{uid}_{unique_id}.{extension}"
+        f"input_{uid}_{item_id}.{extension}"
     )
 
     status = await message.answer(
@@ -760,128 +1061,183 @@ async def on_media(message: Message):
         f"{downloaded_size:.2f} MB"
     )
 
-    user_files[uid] = {
+    queue = get_user_queue(uid)
+
+    item = {
+        "id": item_id,
         "path": local_path,
         "type": media_type,
         "original_name": original_name,
+        "chat_id": message.chat.id,
+        "status": "waiting",
+        "mode": None,
+        "extend_seconds": 0,
     }
 
-    if media_type == "video":
+    queue.append(item)
 
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="⚡ Швидкий режим",
-                        callback_data="video_metadata",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="🎞 Легка зміна відео",
-                        callback_data="video_noise",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="🖼 Метадані + прев’ю",
-                        callback_data="video_preview",
-                    )
-                ],
-            ]
-        )
+    position = len(queue)
 
+    if position == 1 and uid not in processing_users:
         await status.edit_text(
-            "✅ <b>Відео отримано.</b>\n\n"
-            f"Розмір: {downloaded_size:.1f} МБ\n\n"
-            "Обери спосіб обробки:",
-            reply_markup=kb,
+            "✅ <b>Файл додано.</b>\n\n"
+            f"Розмір: {downloaded_size:.1f} МБ\n"
+            "Зараз покажу налаштування обробки."
         )
+
+        await show_next_item(uid)
 
     else:
-
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="📝 Очистити метадані",
-                        callback_data="image_metadata",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="🖼 Змінити пікселі",
-                        callback_data="image_pixels",
-                    )
-                ],
-            ]
-        )
-
         await status.edit_text(
-            "✅ <b>Зображення отримано.</b>\n\n"
-            "Обери спосіб обробки:",
-            reply_markup=kb,
+            "✅ <b>Додано в чергу.</b>\n\n"
+            f"📦 Позиція: <b>{position}</b>\n"
+            f"📚 Всього в черзі: <b>{len(queue)}</b>"
         )
 
 
 # =========================================================
-# VIDEO PROCESSING
+# VIDEO: ВИБІР РЕЖИМУ
 # =========================================================
 
-@dp.callback_query(
-    F.data.in_({
-        "video_metadata",
-        "video_noise",
-        "video_preview",
-    })
-)
-async def process_video(
+@dp.callback_query(F.data.startswith("vm|"))
+async def choose_video_mode(
     callback: CallbackQuery
 ):
 
     uid = callback.from_user.id
 
-    await callback.answer()
-
     if not is_allowed(uid):
-
-        await callback.message.edit_text(
-            "⛔ <b>Доступ до бота обмежений.</b>\n\n"
-            "Твій Telegram ID:\n"
-            f"<code>{uid}</code>"
-        )
-
-        return
-
-    if uid in processing_users:
-
         await callback.answer(
-            "Файл уже обробляється.",
+            "Доступ обмежений.",
             show_alert=True,
         )
         return
 
-    data = user_files.get(uid)
+    try:
+        _, item_id, mode = callback.data.split("|", 2)
+    except ValueError:
+        await callback.answer("Некоректна кнопка.", show_alert=True)
+        return
 
-    if not data:
+    if mode not in {"metadata", "noise", "preview"}:
+        await callback.answer("Невідомий режим.", show_alert=True)
+        return
 
-        await callback.message.edit_text(
-            "❌ Файл загубився. "
-            "Надішли його ще раз."
+    if not item_is_active(uid, item_id):
+        await callback.answer(
+            "Цей файл уже не активний.",
+            show_alert=True,
         )
         return
 
-    local_path = data["path"]
+    item = active_item(uid)
 
-    if not os.path.exists(local_path):
-
-        await callback.message.edit_text(
-            "❌ Тимчасовий файл "
-            "вже видалений."
+    if item.get("status") != "choosing_mode":
+        await callback.answer(
+            "Режим уже вибрано.",
+            show_alert=True,
         )
         return
+
+    item["mode"] = mode
+    item["status"] = "choosing_extension"
+
+    mode_names = {
+        "metadata": "⚡ Швидкий режим",
+        "noise": "🎞 Легка зміна відео",
+        "preview": "🖼 Метадані + прев’ю",
+    }
+
+    await callback.answer()
+
+    await callback.message.edit_text(
+        f"✅ Обрано: <b>{mode_names[mode]}</b>\n\n"
+        "Подовжити відео останнім кадром?\n"
+        "Додана частина буде без звуку.",
+        reply_markup=extension_keyboard(item_id),
+    )
+
+
+# =========================================================
+# VIDEO: ВИБІР +0 / +30 / +60 СЕКУНД
+# =========================================================
+
+@dp.callback_query(F.data.startswith("ve|"))
+async def choose_video_extension(
+    callback: CallbackQuery
+):
+
+    uid = callback.from_user.id
+
+    try:
+        _, item_id, seconds_raw = callback.data.split("|", 2)
+        extend_seconds = int(seconds_raw)
+    except (ValueError, TypeError):
+        await callback.answer("Некоректна кнопка.", show_alert=True)
+        return
+
+    if extend_seconds not in {0, 30, 60}:
+        await callback.answer("Некоректна тривалість.", show_alert=True)
+        return
+
+    if not item_is_active(uid, item_id):
+        await callback.answer(
+            "Цей файл уже не активний.",
+            show_alert=True,
+        )
+        return
+
+    item = active_item(uid)
+
+    if item.get("status") != "choosing_extension":
+        await callback.answer(
+            "Налаштування вже вибрані.",
+            show_alert=True,
+        )
+        return
+
+    item["extend_seconds"] = extend_seconds
+    item["status"] = "processing"
 
     processing_users.add(uid)
+
+    await callback.answer()
+
+    queue = get_user_queue(uid)
+    total = len(queue)
+
+    extend_text = (
+        "без подовження"
+        if extend_seconds == 0
+        else f"+{extend_seconds} сек"
+    )
+
+    await callback.message.edit_text(
+        "⏳ <b>Обробляю відео...</b>\n\n"
+        f"Подовження: <b>{extend_text}</b>\n"
+        f"📦 Зараз: <b>1/{total}</b> у поточній черзі"
+    )
+
+    await process_active_video(
+        uid,
+        callback.message.chat.id,
+    )
+
+
+async def process_active_video(
+    uid: int,
+    chat_id: int,
+):
+
+    item = active_item(uid)
+
+    if not item:
+        processing_users.discard(uid)
+        return
+
+    local_path = item["path"]
+    mode = item["mode"]
+    extend_seconds = item["extend_seconds"]
 
     out_path = os.path.join(
         TMP_DIR,
@@ -889,174 +1245,27 @@ async def process_video(
     )
 
     try:
-
-        if callback.data == "video_metadata":
-
-            await callback.message.edit_text(
-                "⚡ Обробляю відео..."
-            )
-
-            unique = uuid.uuid4().hex
-
-            args = [
-                "-i",
-                local_path,
-
-                "-map",
-                "0:v:0",
-
-                "-map",
-                "0:a?",
-
-                "-c",
-                "copy",
-
-                "-metadata",
-                f"title=Unique_{unique}",
-
-                "-metadata",
-                f"comment=ID_{unique}",
-
-                "-metadata",
-                f"description=Processed_{unique}",
-
-                "-movflags",
-                "+faststart",
-
-                out_path,
-            ]
-
-        elif callback.data == "video_noise":
-
-            await callback.message.edit_text(
-                "🎞 Перекодовую відео...\n\n"
-                "Це може зайняти деякий час."
-            )
-
-            unique = uuid.uuid4().hex
-
-            args = [
-                "-i",
-                local_path,
-
-                "-map",
-                "0:v:0",
-
-                "-map",
-                "0:a?",
-
-                "-vf",
-                "noise=alls=2:allf=t+u",
-
-                "-c:v",
-                "libx264",
-
-                "-preset",
-                "veryfast",
-
-                "-crf",
-                "23",
-
-                "-pix_fmt",
-                "yuv420p",
-
-                "-c:a",
-                "aac",
-
-                "-b:a",
-                "192k",
-
-                "-metadata",
-                f"title=Unique_{unique}",
-
-                "-metadata",
-                f"comment=ID_{unique}",
-
-                "-movflags",
-                "+faststart",
-
-                out_path,
-            ]
-
-        else:
-
-            await callback.message.edit_text(
-                "🖼 Створюю розмите прев’ю...\n\n"
-                "Додаю 1 розмитий кадр на початок."
-            )
-
-            unique = uuid.uuid4().hex
-
-            preview_filter = (
-                "tpad=start=1:start_mode=clone,"
-                "boxblur="
-                "luma_radius='min(100,min(w,h)/2-1)':"
-                "luma_power=1:"
-                "chroma_radius='min(100,min(cw,ch)/2-1)':"
-                "chroma_power=1:"
-                "enable='eq(n,0)',"
-                "gblur=sigma=100:enable='eq(n,0)'"
-            )
-
-            args = [
-                "-i",
-                local_path,
-
-                "-map",
-                "0:v:0",
-
-                "-map",
-                "0:a?",
-
-                "-vf",
-                preview_filter,
-
-                "-c:v",
-                "libx264",
-
-                "-preset",
-                "veryfast",
-
-                "-crf",
-                "18",
-
-                "-pix_fmt",
-                "yuv420p",
-
-                "-c:a",
-                "copy",
-
-                "-metadata",
-                f"title=Unique_{unique}",
-
-                "-metadata",
-                f"comment=Preview_{unique}",
-
-                "-metadata",
-                f"description=Processed_{unique}",
-
-                "-movflags",
-                "+faststart",
-
-                out_path,
-            ]
-
-        ok, error = await run_ffmpeg(
-            args
+        ok, error = await process_video_file(
+            input_path=local_path,
+            output_path=out_path,
+            mode=mode,
+            extend_seconds=extend_seconds,
         )
 
         if not ok:
-
-            await callback.message.edit_text(
-                "❌ <b>FFmpeg помилка</b>\n\n"
-                f"<code>{error}</code>"
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "❌ <b>FFmpeg помилка</b>\n\n"
+                    f"<code>{error}</code>"
+                ),
             )
             return
 
         if not os.path.exists(out_path):
-
-            await callback.message.edit_text(
-                "❌ FFmpeg не створив файл."
+            await bot.send_message(
+                chat_id=chat_id,
+                text="❌ FFmpeg не створив файл.",
             )
             return
 
@@ -1066,9 +1275,12 @@ async def process_video(
             / 1024
         )
 
-        await callback.message.edit_text(
-            "📤 Відправляю готове відео...\n\n"
-            f"Розмір: {size_mb:.1f} МБ"
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "📤 Відправляю готове відео...\n"
+                f"Розмір: {size_mb:.1f} МБ"
+            ),
         )
 
         output_file = FSInputFile(
@@ -1079,82 +1291,85 @@ async def process_video(
             ),
         )
 
-        await callback.message.answer_video(
+        await bot.send_video(
+            chat_id=chat_id,
             video=output_file,
             caption="✅ <b>Готово!</b>",
             supports_streaming=True,
         )
 
-        await callback.message.delete()
-
-        cleanup_user_file(uid)
-
     except Exception as e:
 
-        await callback.message.edit_text(
-            "❌ <b>Помилка обробки</b>\n\n"
-            f"<code>{str(e)}</code>"
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "❌ <b>Помилка обробки</b>\n\n"
+                f"<code>{str(e)}</code>"
+            ),
         )
 
     finally:
-
         remove_file(out_path)
-        processing_users.discard(uid)
+        await finish_current_item(uid)
 
 
 # =========================================================
 # IMAGE PROCESSING
 # =========================================================
 
-@dp.callback_query(
-    F.data.in_({
-        "image_metadata",
-        "image_pixels",
-    })
-)
+@dp.callback_query(F.data.startswith("im|"))
 async def process_image(
     callback: CallbackQuery
 ):
 
     uid = callback.from_user.id
 
-    await callback.answer()
-
     if not is_allowed(uid):
-
-        await callback.message.edit_text(
-            "⛔ <b>Доступ до бота обмежений.</b>\n\n"
-            "Твій Telegram ID:\n"
-            f"<code>{uid}</code>"
+        await callback.answer(
+            "Доступ обмежений.",
+            show_alert=True,
         )
+        return
 
+    try:
+        _, item_id, mode = callback.data.split("|", 2)
+    except ValueError:
+        await callback.answer("Некоректна кнопка.", show_alert=True)
+        return
+
+    if mode not in {"metadata", "pixels"}:
+        await callback.answer("Невідомий режим.", show_alert=True)
+        return
+
+    if not item_is_active(uid, item_id):
+        await callback.answer(
+            "Цей файл уже не активний.",
+            show_alert=True,
+        )
         return
 
     if uid in processing_users:
-
         await callback.answer(
             "Файл уже обробляється.",
             show_alert=True,
         )
         return
 
-    data = user_files.get(uid)
+    item = active_item(uid)
 
-    if not data:
-
-        await callback.message.edit_text(
-            "❌ Файл загубився."
-        )
+    if item["type"] != "image":
+        await callback.answer("Це не зображення.", show_alert=True)
         return
 
-    local_path = data["path"]
-
+    item["status"] = "processing"
     processing_users.add(uid)
 
+    await callback.answer()
+
+    local_path = item["path"]
     out_path = None
 
     try:
-
         with Image.open(local_path) as img:
 
             has_alpha = (
@@ -1177,7 +1392,7 @@ async def process_image(
             "🖼 Обробляю зображення..."
         )
 
-        if callback.data == "image_metadata":
+        if mode == "metadata":
 
             ok, error = await asyncio.to_thread(
                 image_metadata_mode,
@@ -1217,8 +1432,6 @@ async def process_image(
 
         await callback.message.delete()
 
-        cleanup_user_file(uid)
-
     except Exception as e:
 
         await callback.message.edit_text(
@@ -1231,7 +1444,7 @@ async def process_image(
         if out_path:
             remove_file(out_path)
 
-        processing_users.discard(uid)
+        await finish_current_item(uid)
 
 
 # =========================================================
@@ -1252,7 +1465,9 @@ async def unsupported(
     await message.answer(
         "Надішли мені відео або фото.\n\n"
         "🎬 Відео — до 50 МБ\n"
-        "🖼 JPG / PNG / WEBP"
+        "🖼 JPG / PNG / WEBP\n\n"
+        "Можна надсилати кілька файлів підряд — "
+        "вони стануть у чергу."
     )
 
 
