@@ -349,6 +349,42 @@ async def run_ffmpeg(
         return False, str(e)
 
 
+async def get_video_duration(video_path: str) -> float:
+    """
+    Повертає тривалість відео в секундах через ffprobe.
+    Потрібно, щоб blur + countdown починалися рівно
+    після завершення оригінального відео.
+    """
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            video_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        stdout, _stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            return 0.0
+
+        value = stdout.decode(errors="ignore").strip()
+
+        duration = float(value)
+
+        if duration > 0:
+            return duration
+
+    except Exception:
+        pass
+
+    return 0.0
+
+
 # =========================================================
 # IMAGE METADATA
 # =========================================================
@@ -793,10 +829,85 @@ async def process_video_file(
         return False, "Невідомий режим відео."
 
     if extend_seconds > 0:
-        # Останній кадр заморожується на +30/+60 секунд.
-        # Аудіодоріжку НЕ подовжуємо, тому додана частина тиха.
+
+        original_duration = await get_video_duration(
+            input_path
+        )
+
+        if original_duration <= 0:
+            return False, (
+                "Не вдалося визначити тривалість відео "
+                "для countdown."
+            )
+
+        # Невеликий запас проти похибки контейнера/PTS.
+        countdown_start = max(
+            0.0,
+            original_duration - 0.05
+        )
+
+        # Останній кадр заморожуємо на +30/+60 секунд.
         filters.append(
             f"tpad=stop_mode=clone:stop_duration={extend_seconds}"
+        )
+
+        # Розмиваємо ТІЛЬКИ додану частину.
+        filters.append(
+            (
+                "boxblur="
+                "luma_radius='min(100,min(w,h)/2-1)':"
+                "luma_power=1:"
+                "chroma_radius='min(100,min(cw,ch)/2-1)':"
+                "chroma_power=1:"
+                f"enable='gte(t,{countdown_start:.3f})'"
+            )
+        )
+
+        filters.append(
+            (
+                "gblur=sigma=100:"
+                f"enable='gte(t,{countdown_start:.3f})'"
+            )
+        )
+
+        # Чорна напівпрозора підкладка по центру.
+        # Розмір залежить від висоти кадру, тому працює
+        # і для вертикальних, і для горизонтальних відео.
+        filters.append(
+            (
+                "drawbox="
+                "x=iw/2-(ih*0.19):"
+                "y=ih/2-(ih*0.07):"
+                "w=ih*0.38:"
+                "h=ih*0.14:"
+                "color=black@0.82:"
+                "t=fill:"
+                f"enable='gte(t,{countdown_start:.3f})'"
+            )
+        )
+
+        # Countdown у секундах:
+        # +30 -> 30, 29, 28 ... 00
+        # +60 -> 60, 59, 58 ... 00
+        countdown_expr = (
+            "%{eif\\:"
+            f"max(0\\,{extend_seconds}-floor(t-{countdown_start:.3f}))"
+            "\\:d\\:2}"
+        )
+
+        filters.append(
+            (
+                "drawtext="
+                f"text='{countdown_expr}':"
+                "fontcolor=white:"
+                "fontsize=h*0.075:"
+                "x=(w-text_w)/2:"
+                "y=(h-text_h)/2:"
+                "shadowcolor=black@0.40:"
+                "shadowx=2:"
+                "shadowy=2:"
+                f"enable='gte(t,{countdown_start:.3f})'"
+            )
         )
 
     vf = common_reencode_filter(filters)
@@ -1192,32 +1303,77 @@ async def on_media(message: Message):
 
         else:
 
+            # Нове тимчасове повідомлення "⏳ Завантажую файл..."
+            # видаляємо, а єдине batch-повідомлення просто оновлюємо.
+            try:
+                await status.delete()
+            except Exception:
+                pass
+
             state = batch["state"]
 
-            if state == "processing":
-                state_text = (
-                    "⚙️ Пачка вже обробляється.\n"
-                    "Це відео автоматично отримає "
-                    "ті самі налаштування."
-                )
-            elif state == "choosing_extension":
-                state_text = (
-                    "✅ Режим уже вибрано.\n"
-                    "Це відео увійде в цю ж пачку."
-                )
-            else:
-                state_text = (
-                    "Налаштування вибираються один раз "
-                    "для всієї пачки."
+            if state == "choosing_mode":
+
+                batch_text = (
+                    "✅ <b>Відео додано в пачку.</b>\n\n"
+                    f"📦 Зараз у пачці: <b>{batch['total_received']}</b>\n\n"
+                    "Обери спосіб унікалізації.\n"
+                    "Ці налаштування застосуються "
+                    "<b>до всієї пачки</b>:"
                 )
 
-            await status.edit_text(
-                "✅ <b>Додано в пачку.</b>\n\n"
-                f"📦 Відео в очікуванні: <b>{count}</b>\n"
-                f"📚 Всього прийнято в цю пачку: "
-                f"<b>{batch['total_received']}</b>\n\n"
-                f"{state_text}"
-            )
+                keyboard = batch_video_mode_keyboard()
+
+            elif state == "choosing_extension":
+
+                mode_names = {
+                    "metadata": "⚡ Швидкий режим",
+                    "noise": "🎞 Легка зміна відео",
+                    "preview": "🖼 Метадані + прев’ю",
+                }
+
+                batch_text = (
+                    "✅ <b>Відео додано в пачку.</b>\n\n"
+                    f"📦 Зараз у пачці: <b>{batch['total_received']}</b>\n"
+                    f"Режим: <b>{mode_names[batch['mode']]}</b>\n\n"
+                    "Обери подовження для "
+                    "<b>всієї пачки</b>:"
+                )
+
+                keyboard = batch_extension_keyboard()
+
+            else:
+
+                extend_seconds = batch.get("extend_seconds") or 0
+
+                extend_text = (
+                    "без подовження"
+                    if extend_seconds == 0
+                    else f"+{extend_seconds} сек"
+                )
+
+                batch_text = (
+                    "⚙️ <b>Пачка обробляється...</b>\n\n"
+                    f"📚 Всього прийнято: <b>{batch['total_received']}</b>\n"
+                    f"✅ Готово: <b>{batch['processed']}</b>\n"
+                    f"⏱ Подовження: <b>{extend_text}</b>\n\n"
+                    "Нове відео додано в цю ж пачку "
+                    "з тими самими налаштуваннями."
+                )
+
+                keyboard = None
+
+            try:
+                await bot.edit_message_text(
+                    chat_id=batch["chat_id"],
+                    message_id=batch["settings_message_id"],
+                    text=batch_text,
+                    reply_markup=keyboard,
+                )
+            except Exception as e:
+                print(
+                    f"Batch status update error: {e}"
+                )
 
         return
 
@@ -1327,7 +1483,9 @@ async def choose_batch_video_mode(
         "Це налаштування також застосовується "
         "<b>до всієї пачки</b>.\n\n"
         "При +30/+60 сек останній кадр "
-        "заморожується, доданий відрізок — у тиші.",
+        "сильно розмивається, поверх по центру йде "
+        "countdown на чорній підкладці, а доданий "
+        "відрізок залишається у тиші.",
         reply_markup=batch_extension_keyboard(),
     )
 
