@@ -129,8 +129,36 @@ dp = Dispatcher()
 # Вони будуть оброблятися строго по черзі.
 user_queues: dict[int, deque] = {}
 
+# Окремі пачки ВІДЕО.
+# Налаштування вибираються один раз і застосовуються до всієї пачки.
+video_batches: dict[int, dict] = {}
+
 # Користувачі, в яких зараз реально працює FFmpeg/Pillow.
 processing_users: set[int] = set()
+
+
+def get_video_batch(user_id: int, chat_id: int | None = None) -> dict:
+    batch = video_batches.get(user_id)
+
+    if batch is None:
+        batch = {
+            "files": [],
+            "mode": None,
+            "extend_seconds": None,
+            "state": "choosing_mode",
+            "settings_message_sent": False,
+            "settings_message_id": None,
+            "chat_id": chat_id,
+            "total_received": 0,
+            "processed": 0,
+            "failed": 0,
+        }
+        video_batches[user_id] = batch
+
+    if chat_id is not None:
+        batch["chat_id"] = chat_id
+
+    return batch
 
 
 def get_user_queue(user_id: int) -> deque:
@@ -529,6 +557,54 @@ def extension_keyboard(item_id: str) -> InlineKeyboardMarkup:
     )
 
 
+def batch_video_mode_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⚡ Швидкий режим",
+                    callback_data="batch_vm|metadata",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎞 Легка зміна відео",
+                    callback_data="batch_vm|noise",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🖼 Метадані + прев’ю",
+                    callback_data="batch_vm|preview",
+                )
+            ],
+        ]
+    )
+
+
+def batch_extension_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Без подовження",
+                    callback_data="batch_ve|0",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="+30 секунд",
+                    callback_data="batch_ve|30",
+                ),
+                InlineKeyboardButton(
+                    text="+60 секунд",
+                    callback_data="batch_ve|60",
+                ),
+            ],
+        ]
+    )
+
+
 def image_mode_keyboard(item_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -885,8 +961,10 @@ async def cmd_start(message: Message):
     await message.answer(
         "👋 <b>Унікалізатор готовий</b>\n\n"
         "Надсилай відео або фото.\n"
-        "Можеш накидати одразу кілька файлів — "
-        "вони підуть у чергу та обробляться по черзі. 👇"
+        "Можеш накидати одразу кілька відео — "
+        "вони утворять одну пачку. "
+        "Режим і подовження вибираються один раз "
+        "для всієї пачки. 👇"
     )
 
 
@@ -1061,6 +1139,92 @@ async def on_media(message: Message):
         f"{downloaded_size:.2f} MB"
     )
 
+    # =====================================================
+    # VIDEO -> ОДНА ПАЧКА, ОДНІ НАЛАШТУВАННЯ
+    # =====================================================
+
+    if media_type == "video":
+
+        batch = get_video_batch(
+            uid,
+            message.chat.id,
+        )
+
+        item = {
+            "id": item_id,
+            "path": local_path,
+            "type": "video",
+            "original_name": original_name,
+            "chat_id": message.chat.id,
+            "message_id": message.message_id,
+        }
+
+        batch["files"].append(item)
+
+        # Щоб порядок відповідав порядку повідомлень у Telegram,
+        # а не швидкості завантаження файлів.
+        batch["files"].sort(
+            key=lambda x: x.get("message_id", 0)
+        )
+
+        batch["total_received"] += 1
+
+        count = len(batch["files"])
+
+        # Перший файл у новій пачці створює ЄДИНЕ повідомлення
+        # з налаштуваннями для всієї пачки.
+        if (
+            batch["state"] == "choosing_mode"
+            and not batch["settings_message_sent"]
+        ):
+
+            batch["settings_message_sent"] = True
+            batch["settings_message_id"] = status.message_id
+
+            await status.edit_text(
+                "✅ <b>Відео додано в пачку.</b>\n\n"
+                f"📦 Зараз у пачці: <b>{count}</b>\n\n"
+                "Обери спосіб унікалізації.\n"
+                "Ці налаштування застосуються "
+                "<b>до всієї пачки</b>:",
+                reply_markup=batch_video_mode_keyboard(),
+            )
+
+        else:
+
+            state = batch["state"]
+
+            if state == "processing":
+                state_text = (
+                    "⚙️ Пачка вже обробляється.\n"
+                    "Це відео автоматично отримає "
+                    "ті самі налаштування."
+                )
+            elif state == "choosing_extension":
+                state_text = (
+                    "✅ Режим уже вибрано.\n"
+                    "Це відео увійде в цю ж пачку."
+                )
+            else:
+                state_text = (
+                    "Налаштування вибираються один раз "
+                    "для всієї пачки."
+                )
+
+            await status.edit_text(
+                "✅ <b>Додано в пачку.</b>\n\n"
+                f"📦 Відео в очікуванні: <b>{count}</b>\n"
+                f"📚 Всього прийнято в цю пачку: "
+                f"<b>{batch['total_received']}</b>\n\n"
+                f"{state_text}"
+            )
+
+        return
+
+    # =====================================================
+    # IMAGE -> СТАРА ІНДИВІДУАЛЬНА ЧЕРГА
+    # =====================================================
+
     queue = get_user_queue(uid)
 
     item = {
@@ -1096,11 +1260,11 @@ async def on_media(message: Message):
 
 
 # =========================================================
-# VIDEO: ВИБІР РЕЖИМУ
+# VIDEO BATCH: ВИБІР РЕЖИМУ ДЛЯ ВСІЄЇ ПАЧКИ
 # =========================================================
 
-@dp.callback_query(F.data.startswith("vm|"))
-async def choose_video_mode(
+@dp.callback_query(F.data.startswith("batch_vm|"))
+async def choose_batch_video_mode(
     callback: CallbackQuery
 ):
 
@@ -1113,34 +1277,40 @@ async def choose_video_mode(
         )
         return
 
+    batch = video_batches.get(uid)
+
+    if not batch:
+        await callback.answer(
+            "Пачка вже завершена або не знайдена.",
+            show_alert=True,
+        )
+        return
+
+    if batch.get("state") != "choosing_mode":
+        await callback.answer(
+            "Режим для цієї пачки вже вибрано.",
+            show_alert=True,
+        )
+        return
+
     try:
-        _, item_id, mode = callback.data.split("|", 2)
+        _, mode = callback.data.split("|", 1)
     except ValueError:
-        await callback.answer("Некоректна кнопка.", show_alert=True)
+        await callback.answer(
+            "Некоректна кнопка.",
+            show_alert=True,
+        )
         return
 
     if mode not in {"metadata", "noise", "preview"}:
-        await callback.answer("Невідомий режим.", show_alert=True)
-        return
-
-    if not item_is_active(uid, item_id):
         await callback.answer(
-            "Цей файл уже не активний.",
+            "Невідомий режим.",
             show_alert=True,
         )
         return
 
-    item = active_item(uid)
-
-    if item.get("status") != "choosing_mode":
-        await callback.answer(
-            "Режим уже вибрано.",
-            show_alert=True,
-        )
-        return
-
-    item["mode"] = mode
-    item["status"] = "choosing_extension"
+    batch["mode"] = mode
+    batch["state"] = "choosing_extension"
 
     mode_names = {
         "metadata": "⚡ Швидкий режим",
@@ -1151,60 +1321,72 @@ async def choose_video_mode(
     await callback.answer()
 
     await callback.message.edit_text(
-        f"✅ Обрано: <b>{mode_names[mode]}</b>\n\n"
-        "Подовжити відео останнім кадром?\n"
-        "Додана частина буде без звуку.",
-        reply_markup=extension_keyboard(item_id),
+        f"✅ Для всієї пачки обрано:\n"
+        f"<b>{mode_names[mode]}</b>\n\n"
+        "Тепер обери подовження.\n"
+        "Це налаштування також застосовується "
+        "<b>до всієї пачки</b>.\n\n"
+        "При +30/+60 сек останній кадр "
+        "заморожується, доданий відрізок — у тиші.",
+        reply_markup=batch_extension_keyboard(),
     )
 
 
 # =========================================================
-# VIDEO: ВИБІР +0 / +30 / +60 СЕКУНД
+# VIDEO BATCH: +0 / +30 / +60 ДЛЯ ВСІЄЇ ПАЧКИ
 # =========================================================
 
-@dp.callback_query(F.data.startswith("ve|"))
-async def choose_video_extension(
+@dp.callback_query(F.data.startswith("batch_ve|"))
+async def choose_batch_extension(
     callback: CallbackQuery
 ):
 
     uid = callback.from_user.id
 
+    if not is_allowed(uid):
+        await callback.answer(
+            "Доступ обмежений.",
+            show_alert=True,
+        )
+        return
+
+    batch = video_batches.get(uid)
+
+    if not batch:
+        await callback.answer(
+            "Пачка вже завершена або не знайдена.",
+            show_alert=True,
+        )
+        return
+
+    if batch.get("state") != "choosing_extension":
+        await callback.answer(
+            "Подовження вже вибрано.",
+            show_alert=True,
+        )
+        return
+
     try:
-        _, item_id, seconds_raw = callback.data.split("|", 2)
+        _, seconds_raw = callback.data.split("|", 1)
         extend_seconds = int(seconds_raw)
     except (ValueError, TypeError):
-        await callback.answer("Некоректна кнопка.", show_alert=True)
+        await callback.answer(
+            "Некоректна кнопка.",
+            show_alert=True,
+        )
         return
 
     if extend_seconds not in {0, 30, 60}:
-        await callback.answer("Некоректна тривалість.", show_alert=True)
-        return
-
-    if not item_is_active(uid, item_id):
         await callback.answer(
-            "Цей файл уже не активний.",
+            "Некоректна тривалість.",
             show_alert=True,
         )
         return
 
-    item = active_item(uid)
-
-    if item.get("status") != "choosing_extension":
-        await callback.answer(
-            "Налаштування вже вибрані.",
-            show_alert=True,
-        )
-        return
-
-    item["extend_seconds"] = extend_seconds
-    item["status"] = "processing"
+    batch["extend_seconds"] = extend_seconds
+    batch["state"] = "processing"
 
     processing_users.add(uid)
-
-    await callback.answer()
-
-    queue = get_user_queue(uid)
-    total = len(queue)
 
     extend_text = (
         "без подовження"
@@ -1212,105 +1394,197 @@ async def choose_video_extension(
         else f"+{extend_seconds} сек"
     )
 
+    mode_names = {
+        "metadata": "⚡ Швидкий режим",
+        "noise": "🎞 Легка зміна відео",
+        "preview": "🖼 Метадані + прев’ю",
+    }
+
+    await callback.answer()
+
     await callback.message.edit_text(
-        "⏳ <b>Обробляю відео...</b>\n\n"
+        "⏳ <b>Починаю обробку пачки</b>\n\n"
+        f"Режим: <b>{mode_names[batch['mode']]}</b>\n"
         f"Подовження: <b>{extend_text}</b>\n"
-        f"📦 Зараз: <b>1/{total}</b> у поточній черзі"
+        f"📦 Відео: <b>{batch['total_received']}</b>\n\n"
+        "Файли будуть оброблятися по черзі."
     )
 
-    await process_active_video(
-        uid,
-        callback.message.chat.id,
+    # Не блокуємо обробку нових повідомлень.
+    asyncio.create_task(
+        process_video_batch(uid)
     )
 
 
-async def process_active_video(
+async def process_video_batch(
     uid: int,
-    chat_id: int,
 ):
+    batch = video_batches.get(uid)
 
-    item = active_item(uid)
-
-    if not item:
+    if not batch:
         processing_users.discard(uid)
         return
 
-    local_path = item["path"]
-    mode = item["mode"]
-    extend_seconds = item["extend_seconds"]
-
-    out_path = os.path.join(
-        TMP_DIR,
-        f"output_{uid}_{uuid.uuid4().hex}.mp4"
-    )
+    chat_id = batch["chat_id"]
+    status_message_id = batch.get("settings_message_id")
 
     try:
-        ok, error = await process_video_file(
-            input_path=local_path,
-            output_path=out_path,
-            mode=mode,
-            extend_seconds=extend_seconds,
-        )
 
-        if not ok:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "❌ <b>FFmpeg помилка</b>\n\n"
-                    f"<code>{error}</code>"
-                ),
+        while True:
+
+            batch = video_batches.get(uid)
+
+            if not batch:
+                break
+
+            files = batch["files"]
+
+            if not files:
+                break
+
+            # Порядок = порядок повідомлень у Telegram.
+            files.sort(
+                key=lambda x: x.get("message_id", 0)
             )
-            return
 
-        if not os.path.exists(out_path):
-            await bot.send_message(
-                chat_id=chat_id,
-                text="❌ FFmpeg не створив файл.",
+            item = files.pop(0)
+
+            local_path = item["path"]
+            mode = batch["mode"]
+            extend_seconds = batch["extend_seconds"]
+
+            current_number = (
+                batch["processed"]
+                + batch["failed"]
+                + 1
             )
-            return
 
-        size_mb = (
-            os.path.getsize(out_path)
-            / 1024
-            / 1024
-        )
+            total_now = batch["total_received"]
 
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "📤 Відправляю готове відео...\n"
-                f"Розмір: {size_mb:.1f} МБ"
-            ),
-        )
+            if status_message_id:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_message_id,
+                        text=(
+                            "⚙️ <b>Обробляю пачку...</b>\n\n"
+                            f"Зараз: <b>{current_number}/{total_now}</b>\n"
+                            f"Залишилось у черзі: <b>{len(files)}</b>"
+                        ),
+                    )
+                except Exception:
+                    pass
 
-        output_file = FSInputFile(
-            out_path,
-            filename=(
-                f"unique_"
-                f"{uuid.uuid4().hex[:8]}.mp4"
-            ),
-        )
+            out_path = os.path.join(
+                TMP_DIR,
+                f"output_{uid}_{uuid.uuid4().hex}.mp4"
+            )
 
-        await bot.send_video(
-            chat_id=chat_id,
-            video=output_file,
-            caption="✅ <b>Готово!</b>",
-            supports_streaming=True,
-        )
+            try:
 
-    except Exception as e:
+                ok, error = await process_video_file(
+                    input_path=local_path,
+                    output_path=out_path,
+                    mode=mode,
+                    extend_seconds=extend_seconds,
+                )
 
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "❌ <b>Помилка обробки</b>\n\n"
-                f"<code>{str(e)}</code>"
-            ),
-        )
+                if not ok:
+                    batch["failed"] += 1
+
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"❌ <b>Помилка у файлі "
+                            f"{current_number}</b>\n\n"
+                            f"<code>{error}</code>\n\n"
+                            "Переходжу до наступного відео."
+                        ),
+                    )
+
+                    continue
+
+                if not os.path.exists(out_path):
+                    batch["failed"] += 1
+
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"❌ Файл {current_number}: "
+                            "FFmpeg не створив результат.\n"
+                            "Переходжу до наступного."
+                        ),
+                    )
+
+                    continue
+
+                output_file = FSInputFile(
+                    out_path,
+                    filename=(
+                        f"unique_"
+                        f"{uuid.uuid4().hex[:8]}.mp4"
+                    ),
+                )
+
+                await bot.send_video(
+                    chat_id=chat_id,
+                    video=output_file,
+                    caption=(
+                        f"✅ <b>Готово "
+                        f"{current_number}/{batch['total_received']}</b>"
+                    ),
+                    supports_streaming=True,
+                )
+
+                batch["processed"] += 1
+
+            except Exception as e:
+
+                batch["failed"] += 1
+
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"❌ <b>Помилка у файлі "
+                        f"{current_number}</b>\n\n"
+                        f"<code>{str(e)}</code>\n\n"
+                        "Переходжу до наступного."
+                    ),
+                )
+
+            finally:
+
+                remove_file(out_path)
+                remove_file(local_path)
+
+        batch = video_batches.get(uid)
+
+        if batch:
+
+            processed = batch["processed"]
+            failed = batch["failed"]
+            total = batch["total_received"]
+
+            if status_message_id:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_message_id,
+                        text=(
+                            "✅ <b>Пачку завершено</b>\n\n"
+                            f"Всього: <b>{total}</b>\n"
+                            f"Готово: <b>{processed}</b>\n"
+                            f"Помилок: <b>{failed}</b>"
+                        ),
+                    )
+                except Exception:
+                    pass
+
+            video_batches.pop(uid, None)
 
     finally:
-        remove_file(out_path)
-        await finish_current_item(uid)
+
+        processing_users.discard(uid)
 
 
 # =========================================================
@@ -1466,8 +1740,9 @@ async def unsupported(
         "Надішли мені відео або фото.\n\n"
         "🎬 Відео — до 50 МБ\n"
         "🖼 JPG / PNG / WEBP\n\n"
-        "Можна надсилати кілька файлів підряд — "
-        "вони стануть у чергу."
+        "Можна надсилати кілька відео підряд — "
+        "вони обробляться однією пачкою "
+        "з однаковими налаштуваннями."
     )
 
 
