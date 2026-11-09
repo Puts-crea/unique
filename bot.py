@@ -42,7 +42,7 @@ FILE_SERVER_URL = os.getenv(
     "http://telegram-bot-api.railway.internal:8090",
 ).rstrip("/")
 
-MAX_FILE_MB = 50
+MAX_FILE_MB = 100
 TMP_DIR = tempfile.gettempdir()
 
 
@@ -851,6 +851,21 @@ async def process_video_file(
             f"tpad=stop_mode=clone:stop_duration={extend_seconds}"
         )
 
+        # Стискаємо лише доданий хвіст: оскільки кадр заморожений,
+        # а countdown змінюється раз на секунду, залишаємо приблизно
+        # 1 кадр/сек у хвості. Оригінальна частина не змінює FPS.
+        # У preview перед оригіналом додається один кадр, а не секунда.
+        # Малий зсув не дає відкинути останній кадр оригіналу.
+        tail_start = original_duration + (
+            0.001 if mode == "preview" else 0.0
+        )
+        filters.append(
+            "select="
+            f"'if(lt(t,{tail_start:.3f}),1,"
+            f"if(lt(prev_selected_t,{tail_start:.3f}),1,"
+            "gt(t-prev_selected_t,0.95)))'"
+        )
+
         # Розмиваємо ТІЛЬКИ додану частину.
         filters.append(
             (
@@ -937,6 +952,14 @@ async def process_video_file(
         "-pix_fmt",
         "yuv420p",
     ]
+
+    # Для подовженого відео зберігаємо змінну частоту кадрів:
+    # це не дає FFmpeg дублювати кадри в доданому хвості.
+    if extend_seconds > 0:
+        args.extend([
+            "-fps_mode",
+            "vfr",
+        ])
 
     # Зберігаємо поведінку старих режимів:
     # noise перекодовував аудіо в AAC;
@@ -1239,11 +1262,22 @@ async def on_media(message: Message):
         )
         return
 
-    downloaded_size = (
-        os.path.getsize(local_path)
-        / 1024
-        / 1024
-    )
+    downloaded_bytes = os.path.getsize(local_path)
+    max_bytes = MAX_FILE_MB * 1024 * 1024
+
+    # Перевіряємо фактичний розмір після завантаження,
+    # навіть якщо Telegram не передав file_size.
+    if downloaded_bytes > max_bytes:
+        downloaded_size = downloaded_bytes / 1024 / 1024
+        remove_file(local_path)
+        await status.edit_text(
+            "❌ Файл завеликий.\n\n"
+            f"Розмір: {downloaded_size:.1f} МБ\n"
+            f"Максимум: {MAX_FILE_MB} МБ."
+        )
+        return
+
+    downloaded_size = downloaded_bytes / 1024 / 1024
 
     print(
         f"Downloaded: "
@@ -1896,7 +1930,7 @@ async def unsupported(
 
     await message.answer(
         "Надішли мені відео або фото.\n\n"
-        "🎬 Відео — до 50 МБ\n"
+        "🎬 Відео — до 100 МБ\n"
         "🖼 JPG / PNG / WEBP\n\n"
         "Можна надсилати кілька відео підряд — "
         "вони обробляться однією пачкою "
