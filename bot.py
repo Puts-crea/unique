@@ -809,16 +809,8 @@ dp = Dispatcher()
 user_queues: dict[int, deque] = {}
 
 # Окремі пачки ВІДЕО.
-# pending_downloads рахує також ті файли, які ще завантажуються.
+# Налаштування вибираються один раз і застосовуються до всієї пачки.
 video_batches: dict[int, dict] = {}
-
-# Не обмежуємо кількість одночасних завантажень штучним семафором.
-# Це дозволяє всім відео з однієї пачки почати завантажуватися паралельно.
-# Логи active_downloads показують фактичну кількість активних завантажень.
-ACTIVE_DOWNLOADS = 0
-DOWNLOAD_GET_FILE_TIMEOUT = 45
-DOWNLOAD_MAX_ATTEMPTS = 4
-BATCH_IDLE_GRACE_SECONDS = 1.5
 
 # Користувачі, в яких зараз реально працює FFmpeg/Pillow.
 processing_users: set[int] = set()
@@ -827,9 +819,7 @@ processing_users: set[int] = set()
 def get_video_batch(user_id: int, chat_id: int | None = None) -> dict:
     batch = video_batches.get(user_id)
 
-    # Після переходу в finalizing нові повідомлення вже належать
-    # до наступної пачки, а не до тієї, що завершується.
-    if batch is None or batch.get("state") == "finalizing":
+    if batch is None:
         batch = {
             "files": [],
             "batch_id": uuid.uuid4().hex,
@@ -838,19 +828,10 @@ def get_video_batch(user_id: int, chat_id: int | None = None) -> dict:
             "state": "choosing_mode",
             "settings_message_sent": False,
             "settings_message_id": None,
-            "settings_lock": asyncio.Lock(),
             "chat_id": chat_id,
             "total_received": 0,
-            "downloaded_count": 0,
-            "pending_downloads": 0,
-            "pending_message_ids": set(),
-            "received_message_ids": set(),
             "processed": 0,
             "failed": 0,
-            "started": 0,
-            "active": False,
-            "worker_running": False,
-            "wake_event": asyncio.Event(),
         }
         video_batches[user_id] = batch
 
@@ -858,134 +839,6 @@ def get_video_batch(user_id: int, chat_id: int | None = None) -> dict:
         batch["chat_id"] = chat_id
 
     return batch
-
-
-def finish_empty_video_batch(user_id: int, batch: dict):
-    """Закриває пачку, якщо всі завантаження завершилися помилкою."""
-    if (
-        batch.get("pending_downloads", 0) != 0
-        or batch.get("files")
-        or batch.get("worker_running")
-    ):
-        return
-
-    batch["state"] = "finalizing"
-    stats_finish_batch(
-        batch_id=batch["batch_id"],
-        processed=batch.get("processed", 0),
-        failed=batch.get("failed", 0),
-        mode=batch.get("mode") or "not_selected",
-        extension_seconds=batch.get("extend_seconds") or 0,
-    )
-
-    if video_batches.get(user_id) is batch:
-        video_batches.pop(user_id, None)
-
-
-async def update_video_batch_status(
-    batch: dict,
-    status,
-    message: Message,
-):
-    """Створює або оновлює єдине повідомлення стану пачки."""
-
-    async with batch["settings_lock"]:
-        mode_names = {
-            "metadata": "⚡ Швидкий режим",
-            "noise": "🎞 Легка зміна відео",
-            "preview": "🖼 Метадані + прев’ю",
-        }
-
-        pending_count = batch["pending_downloads"]
-        waiting_count = len(batch["files"])
-
-        if not batch["settings_message_sent"]:
-            prompt_text = (
-                "✅ <b>Відео додано в пачку.</b>\n\n"
-                f"📦 Всього отримано: <b>{batch['total_received']}</b>\n"
-                f"⬇️ Ще завантажується: <b>{pending_count}</b>\n\n"
-                "Обери спосіб унікалізації. Налаштування застосуються "
-                "до всієї пачки:"
-            )
-
-            if status:
-                try:
-                    prompt_message = await status.edit_text(
-                        prompt_text,
-                        reply_markup=batch_video_mode_keyboard(),
-                    )
-                except Exception as error:
-                    print(f"Could not edit first batch status: {error}")
-                    prompt_message = await message.answer(
-                        prompt_text,
-                        reply_markup=batch_video_mode_keyboard(),
-                    )
-            else:
-                prompt_message = await message.answer(
-                    prompt_text,
-                    reply_markup=batch_video_mode_keyboard(),
-                )
-
-            batch["settings_message_sent"] = True
-            batch["settings_message_id"] = prompt_message.message_id
-
-            return
-
-        if status:
-            try:
-                await status.delete()
-            except Exception:
-                pass
-
-        state = batch["state"]
-        if state == "choosing_mode":
-            batch_text = (
-                "✅ <b>Відео додано в пачку.</b>\n\n"
-                f"📦 Всього отримано: <b>{batch['total_received']}</b>\n"
-                f"⬇️ Ще завантажується: <b>{pending_count}</b>\n\n"
-                "Обери спосіб унікалізації для всієї пачки:"
-            )
-            keyboard = batch_video_mode_keyboard()
-
-        elif state == "choosing_extension":
-            batch_text = (
-                "✅ <b>Відео додано в пачку.</b>\n\n"
-                f"📦 Всього отримано: <b>{batch['total_received']}</b>\n"
-                f"⬇️ Ще завантажується: <b>{pending_count}</b>\n"
-                f"Режим: <b>{mode_names[batch['mode']]}</b>\n\n"
-                "Обери подовження для всієї пачки:"
-            )
-            keyboard = batch_extension_keyboard()
-
-        elif state == "processing":
-            extend_seconds = batch.get("extend_seconds") or 0
-            extend_text = (
-                "без подовження"
-                if extend_seconds == 0
-                else f"+{extend_seconds} сек"
-            )
-            batch_text = (
-                "⚙️ <b>Пачка обробляється...</b>\n\n"
-                f"📚 Всього отримано: <b>{batch['total_received']}</b>\n"
-                f"⚙️ Готових у черзі: <b>{waiting_count}</b>\n"
-                f"⬇️ Ще завантажується: <b>{pending_count}</b>\n"
-                f"✅ Готово: <b>{batch['processed']}</b>\n"
-                f"⏱ Подовження: <b>{extend_text}</b>"
-            )
-            keyboard = None
-        else:
-            return
-
-        if batch.get("settings_message_id"):
-            try:
-                await bot.edit_message_text(
-                    chat_id=batch["chat_id"],
-                    message_id=batch["settings_message_id"],
-                    text=batch_text,
-                    reply_markup=keyboard,
-                )
-            except Exception as error:
-                print(f"Batch status update error: {error}")
 
 
 def get_user_queue(user_id: int) -> deque:
@@ -1054,210 +907,91 @@ async def access_denied(message: Message):
 # DOWNLOAD ЧЕРЕЗ LOCAL TELEGRAM BOT API
 # =========================================================
 
-def safe_error_text(error: Exception) -> str:
-    """Приховує токен бота з повідомлень і логів."""
-    text = str(error)
-    token = BOT_TOKEN.strip()
-    if token:
-        text = text.replace(token, "[BOT_TOKEN_REDACTED]")
-    return text
-
-
-def is_retryable_download_error(error: Exception) -> bool:
-    text = safe_error_text(error).lower()
-
-    retry_phrases = (
-        "wrong file_id",
-        "temporarily unavailable",
-        "temporary failure",
-        "too many requests",
-        "retry after",
-        "internal server error",
-        "bad gateway",
-        "service unavailable",
-        "gateway timeout",
-        "timed out",
-        "timeout",
-        "connection reset",
-        "connection aborted",
-        "broken pipe",
-        "incomplete download",
-        "empty file",
-        "downloaded file is missing",
-        "http 404",
-        "http 408",
-        "http 429",
-        "http 500",
-        "http 502",
-        "http 503",
-        "http 504",
-    )
-
-    return (
-        isinstance(
-            error,
-            (aiohttp.ClientError, asyncio.TimeoutError, OSError),
-        )
-        or any(phrase in text for phrase in retry_phrases)
-    )
-
-
 async def download_telegram_file(
     file_obj,
     destination: str,
-    *,
-    user_id: int | None = None,
-    message_id: int | None = None,
 ):
-    """Завантажує файл без штучного ліміту паралельності.
 
-    Повторює тимчасові помилки Telegram/local Bot API та файлового сервера.
-    Повний file_path не записується в логи, оскільки локальний шлях може
-    містити токен бота.
-    """
-    global ACTIVE_DOWNLOADS
-
-    expected_size = int(getattr(file_obj, "file_size", 0) or 0)
-    last_error = None
-    download_started = time.perf_counter()
-    ACTIVE_DOWNLOADS += 1
-
-    context = (
-        f"user={user_id if user_id is not None else 'unknown'} "
-        f"message={message_id if message_id is not None else 'unknown'} "
-        f"size={expected_size}B"
+    telegram_file = await bot.get_file(
+        file_obj.file_id
     )
 
-    print(
-        f"[DOWNLOAD] started ({context}); "
-        f"active_downloads={ACTIVE_DOWNLOADS}"
-    )
+    file_path = telegram_file.file_path
 
-    try:
-        for attempt in range(1, DOWNLOAD_MAX_ATTEMPTS + 1):
-            remove_file(destination)
-            attempt_started = time.perf_counter()
-
-            try:
-                # get_file має відповідати швидко. Якщо локальний API завис,
-                # обриваємо саме цей запит і повторюємо його.
-                telegram_file = await asyncio.wait_for(
-                    bot.get_file(file_obj.file_id),
-                    timeout=DOWNLOAD_GET_FILE_TIMEOUT,
-                )
-                file_path = telegram_file.file_path
-
-                if not file_path:
-                    raise RuntimeError(
-                        "Telegram не повернув file_path."
-                    )
-
-                is_local_path = os.path.isabs(file_path)
-                print(
-                    f"[DOWNLOAD] get_file OK ({context}); "
-                    f"attempt={attempt}/{DOWNLOAD_MAX_ATTEMPTS}; "
-                    f"path_type={'local' if is_local_path else 'remote'}"
-                )
-
-                if is_local_path:
-                    root = "/var/lib/telegram-bot-api/"
-
-                    if not file_path.startswith(root):
-                        raise RuntimeError(
-                            "Отримано невідомий абсолютний шлях від Telegram API."
-                        )
-
-                    relative_path = file_path[len(root):]
-                    safe_path = quote(relative_path, safe="/")
-                    download_url = f"{FILE_SERVER_URL}/{safe_path}"
-
-                    timeout = aiohttp.ClientTimeout(
-                        total=900,
-                        connect=60,
-                        sock_read=120,
-                    )
-
-                    async with aiohttp.ClientSession(
-                        timeout=timeout
-                    ) as client:
-                        async with client.get(download_url) as response:
-                            if response.status != 200:
-                                response_text = await response.text()
-                                raise RuntimeError(
-                                    "File server error: "
-                                    f"HTTP {response.status}: "
-                                    f"{response_text[:300]}"
-                                )
-
-                            with open(destination, "wb") as output:
-                                async for chunk in response.content.iter_chunked(
-                                    1024 * 1024
-                                ):
-                                    output.write(chunk)
-                else:
-                    await bot.download_file(
-                        file_path,
-                        destination=destination,
-                    )
-
-                if not os.path.exists(destination):
-                    raise RuntimeError(
-                        "Downloaded file is missing after transfer."
-                    )
-
-                actual_size = os.path.getsize(destination)
-                if actual_size <= 0:
-                    raise RuntimeError("Incomplete download: empty file.")
-
-                if expected_size and actual_size != expected_size:
-                    raise RuntimeError(
-                        "Incomplete download: expected "
-                        f"{expected_size} bytes, received {actual_size} bytes."
-                    )
-
-                elapsed = time.perf_counter() - download_started
-                print(
-                    f"[DOWNLOAD] success ({context}); "
-                    f"received={actual_size}B; "
-                    f"attempt={attempt}/{DOWNLOAD_MAX_ATTEMPTS}; "
-                    f"elapsed={elapsed:.1f}s"
-                )
-                return
-
-            except Exception as error:
-                last_error = error
-                remove_file(destination)
-
-                retryable = is_retryable_download_error(error)
-                if attempt >= DOWNLOAD_MAX_ATTEMPTS or not retryable:
-                    elapsed = time.perf_counter() - download_started
-                    print(
-                        f"[DOWNLOAD] FAILED ({context}); "
-                        f"attempt={attempt}/{DOWNLOAD_MAX_ATTEMPTS}; "
-                        f"retryable={retryable}; elapsed={elapsed:.1f}s; "
-                        f"error={type(error).__name__}: {safe_error_text(error)}"
-                    )
-                    raise
-
-                delay = float(2 ** (attempt - 1))
-                attempt_elapsed = time.perf_counter() - attempt_started
-                print(
-                    f"[DOWNLOAD] attempt {attempt} failed ({context}); "
-                    f"after={attempt_elapsed:.1f}s; "
-                    f"retrying_in={delay:.0f}s; "
-                    f"error={type(error).__name__}: {safe_error_text(error)}"
-                )
-                await asyncio.sleep(delay)
-
-        if last_error:
-            raise last_error
-
-    finally:
-        ACTIVE_DOWNLOADS = max(0, ACTIVE_DOWNLOADS - 1)
-        print(
-            f"[DOWNLOAD] task finished ({context}); "
-            f"active_downloads={ACTIVE_DOWNLOADS}"
+    if not file_path:
+        raise RuntimeError(
+            "Telegram не повернув file_path."
         )
+
+    print(f"Telegram file_path: {file_path}")
+
+    if os.path.isabs(file_path):
+
+        root = "/var/lib/telegram-bot-api/"
+
+        if not file_path.startswith(root):
+            raise RuntimeError(
+                "Отримано невідомий абсолютний шлях: "
+                f"{file_path}"
+            )
+
+        relative_path = file_path[len(root):]
+
+        safe_path = quote(
+            relative_path,
+            safe="/",
+        )
+
+        download_url = (
+            f"{FILE_SERVER_URL}/{safe_path}"
+        )
+
+        print(
+            f"Downloading through file server: "
+            f"{download_url}"
+        )
+
+        timeout = aiohttp.ClientTimeout(
+            total=900,
+            connect=60,
+        )
+
+        async with aiohttp.ClientSession(
+            timeout=timeout
+        ) as client:
+
+            async with client.get(
+                download_url
+            ) as response:
+
+                if response.status != 200:
+
+                    text = await response.text()
+
+                    raise RuntimeError(
+                        "File server error: "
+                        f"HTTP {response.status}: "
+                        f"{text[:300]}"
+                    )
+
+                with open(
+                    destination,
+                    "wb",
+                ) as output:
+
+                    async for chunk in (
+                        response.content.iter_chunked(
+                            1024 * 1024
+                        )
+                    ):
+                        output.write(chunk)
+
+        return
+
+    await bot.download_file(
+        file_path,
+        destination=destination,
+    )
 
 
 # =========================================================
@@ -2473,7 +2207,9 @@ async def cmd_start(message: Message):
 )
 async def on_media(message: Message):
 
-    if not is_allowed(message.from_user.id):
+    if not is_allowed(
+        message.from_user.id
+    ):
         await access_denied(message)
         return
 
@@ -2485,36 +2221,78 @@ async def on_media(message: Message):
     extension = None
 
     if message.video:
+
         file_obj = message.video
         media_type = "video"
-        original_name = message.video.file_name or "video.mp4"
-        extension = get_extension(original_name, "mp4")
+
+        original_name = (
+            message.video.file_name
+            or "video.mp4"
+        )
+
+        extension = get_extension(
+            original_name,
+            "mp4",
+        )
 
     elif message.photo:
+
         file_obj = message.photo[-1]
         media_type = "image"
         original_name = "image.jpg"
         extension = "jpg"
 
     elif message.document:
+
         file_obj = message.document
-        mime = (message.document.mime_type or "").lower()
-        original_name = message.document.file_name or "file"
-        extension = get_extension(original_name, "")
+
+        mime = (
+            message.document.mime_type
+            or ""
+        ).lower()
+
+        original_name = (
+            message.document.file_name
+            or "file"
+        )
+
+        extension = get_extension(
+            original_name,
+            "",
+        )
 
         if mime.startswith("video/"):
+
             media_type = "video"
             extension = extension or "mp4"
+
         elif mime.startswith("image/"):
+
             media_type = "image"
             extension = extension or "jpg"
-        elif extension in {"mp4", "mov", "m4v", "webm", "avi", "mkv"}:
+
+        elif extension in {
+            "mp4",
+            "mov",
+            "m4v",
+            "webm",
+            "avi",
+            "mkv",
+        }:
             media_type = "video"
-        elif extension in {"jpg", "jpeg", "png", "webp"}:
+
+        elif extension in {
+            "jpg",
+            "jpeg",
+            "png",
+            "webp",
+        }:
             media_type = "image"
+
         else:
             await message.answer(
-                "❌ Підтримуються тільки відео та зображення."
+                "❌ Підтримуються тільки "
+                "відео та зображення."
             )
             return
 
@@ -2524,7 +2302,6 @@ async def on_media(message: Message):
     item_id = uuid.uuid4().hex[:12]
     stats_id = f"{message.chat.id}:{message.message_id}"
     initial_size = int(file_obj.file_size or 0)
-
     stats_start_operation(
         event_key=stats_id,
         user_id=uid,
@@ -2533,17 +2310,29 @@ async def on_media(message: Message):
     )
 
     if file_obj.file_size:
-        max_file_mb = MAX_VIDEO_MB if media_type == "video" else MAX_IMAGE_MB
+
+        max_file_mb = (
+            MAX_VIDEO_MB
+            if media_type == "video"
+            else MAX_IMAGE_MB
+        )
         max_bytes = max_file_mb * 1024 * 1024
 
         if file_obj.file_size > max_bytes:
-            size_mb = file_obj.file_size / 1024 / 1024
+
+            size_mb = (
+                file_obj.file_size
+                / 1024
+                / 1024
+            )
+
             stats_update_operation(
                 stats_id,
                 status="failed",
                 error_stage="validation",
                 error_type="FileTooLarge",
             )
+
             await message.answer(
                 "❌ Файл завеликий.\n\n"
                 f"Розмір: {size_mb:.1f} МБ\n"
@@ -2556,112 +2345,83 @@ async def on_media(message: Message):
         f"input_{uid}_{item_id}.{extension}"
     )
 
-    # Резервуємо відео в пачці ДО першого await і ДО завантаження.
-    # Тому обробник пачки одразу бачить усі повідомлення, що вже прийшли.
-    video_batch = None
-    if media_type == "video":
-        video_batch = get_video_batch(uid, message.chat.id)
-        video_batch["pending_downloads"] += 1
-        video_batch["total_received"] += 1
-        video_batch["pending_message_ids"].add(message.message_id)
-        video_batch["received_message_ids"].add(message.message_id)
-        video_batch["wake_event"].set()
-
-        stats_create_batch(video_batch["batch_id"], uid)
-        stats_update_operation(
-            stats_id,
-            batch_id=video_batch["batch_id"],
-        )
-        stats_update_batch(
-            batch_id=video_batch["batch_id"],
-            total_files=video_batch["total_received"],
-            mode=video_batch.get("mode"),
-            extension_seconds=video_batch.get("extend_seconds"),
-        )
-        print(
-            f"[BATCH] video received user={uid} "
-            f"message={message.message_id} "
-            f"total={video_batch['total_received']} "
-            f"pending={video_batch['pending_downloads']} "
-            f"ready={len(video_batch['files'])}"
-        )
-
-    status = None
-    try:
-        status = await message.answer("⏳ Завантажую файл...")
-    except Exception as error:
-        print(f"Could not send upload status message: {error}")
+    status = await message.answer(
+        "⏳ Завантажую файл..."
+    )
 
     try:
         await download_telegram_file(
             file_obj,
             local_path,
-            user_id=uid,
-            message_id=message.message_id,
         )
 
-        if not os.path.exists(local_path):
-            raise RuntimeError("Файл не був завантажений.")
+    except Exception as e:
 
-    except Exception as error:
         remove_file(local_path)
 
         stats_update_operation(
             stats_id,
-            batch_id=(video_batch["batch_id"] if video_batch else None),
             status="failed",
             error_stage="download",
-            error_type=type(error).__name__,
+            error_type=type(e).__name__,
         )
 
-        if video_batch:
-            video_batch["pending_downloads"] = max(
-                0,
-                video_batch["pending_downloads"] - 1,
-            )
-            video_batch["pending_message_ids"].discard(message.message_id)
-            video_batch["failed"] += 1
-            video_batch["wake_event"].set()
-            print(
-                f"[BATCH] video download failed user={uid} "
-                f"message={message.message_id} "
-                f"total={video_batch['total_received']} "
-                f"pending={video_batch['pending_downloads']} "
-                f"ready={len(video_batch['files'])} "
-                f"failed={video_batch['failed']}"
-            )
-            finish_empty_video_batch(uid, video_batch)
-
-        error_text = (
+        await status.edit_text(
             "❌ <b>Помилка завантаження</b>\n\n"
-            f"<code>{safe_error_text(error)}</code>"
+            f"<code>{str(e)}</code>"
         )
-        try:
-            if status:
-                await status.edit_text(error_text)
-            else:
-                await message.answer(error_text)
-        except Exception as send_error:
-            print(f"Could not report download error: {send_error}")
+        return
+
+    if not os.path.exists(local_path):
+
+        stats_update_operation(
+            stats_id,
+            status="failed",
+            error_stage="download",
+            error_type="DownloadedFileMissing",
+        )
+
+        await status.edit_text(
+            "❌ Файл не був завантажений."
+        )
         return
 
     actual_size_bytes = os.path.getsize(local_path)
-    downloaded_size = actual_size_bytes / 1024 / 1024
+    downloaded_size = (
+        actual_size_bytes
+        / 1024
+        / 1024
+    )
 
     stats_update_operation(
         stats_id,
         file_size_bytes=actual_size_bytes,
     )
 
-    print(f"Downloaded: {downloaded_size:.2f} MB")
+    print(
+        f"Downloaded: "
+        f"{downloaded_size:.2f} MB"
+    )
 
     # =====================================================
     # VIDEO -> ОДНА ПАЧКА, ОДНІ НАЛАШТУВАННЯ
     # =====================================================
 
     if media_type == "video":
-        batch = video_batch
-        duration = await get_video_duration(local_path)
+
+        batch = get_video_batch(
+            uid,
+            message.chat.id,
+        )
+
+        stats_create_batch(batch["batch_id"], uid)
+        stats_update_operation(
+            stats_id,
+            batch_id=batch["batch_id"],
+            video_duration_seconds=(
+                await get_video_duration(local_path)
+            ) or None,
+        )
 
         item = {
             "id": item_id,
@@ -2675,27 +2435,15 @@ async def on_media(message: Message):
         }
 
         batch["files"].append(item)
-        batch["files"].sort(key=lambda x: x.get("message_id", 0))
-        batch["downloaded_count"] += 1
-        batch["pending_downloads"] = max(
-            0,
-            batch["pending_downloads"] - 1,
-        )
-        batch["pending_message_ids"].discard(message.message_id)
-        batch["wake_event"].set()
-        print(
-            f"[BATCH] video ready user={uid} "
-            f"message={message.message_id} "
-            f"total={batch['total_received']} "
-            f"pending={batch['pending_downloads']} "
-            f"ready={len(batch['files'])}"
+
+        # Щоб порядок відповідав порядку повідомлень у Telegram,
+        # а не швидкості завантаження файлів.
+        batch["files"].sort(
+            key=lambda x: x.get("message_id", 0)
         )
 
-        stats_update_operation(
-            stats_id,
-            batch_id=batch["batch_id"],
-            video_duration_seconds=duration or None,
-        )
+        batch["total_received"] += 1
+
         stats_update_batch(
             batch_id=batch["batch_id"],
             total_files=batch["total_received"],
@@ -2703,11 +2451,100 @@ async def on_media(message: Message):
             extension_seconds=batch.get("extend_seconds"),
         )
 
-        await update_video_batch_status(
-            batch=batch,
-            status=status,
-            message=message,
-        )
+        count = len(batch["files"])
+
+        # Перший файл у новій пачці створює ЄДИНЕ повідомлення
+        # з налаштуваннями для всієї пачки.
+        if (
+            batch["state"] == "choosing_mode"
+            and not batch["settings_message_sent"]
+        ):
+
+            batch["settings_message_sent"] = True
+            batch["settings_message_id"] = status.message_id
+
+            await status.edit_text(
+                "✅ <b>Відео додано в пачку.</b>\n\n"
+                f"📦 Зараз у пачці: <b>{count}</b>\n\n"
+                "Обери спосіб унікалізації.\n"
+                "Ці налаштування застосуються "
+                "<b>до всієї пачки</b>:",
+                reply_markup=batch_video_mode_keyboard(),
+            )
+
+        else:
+
+            # Нове тимчасове повідомлення "⏳ Завантажую файл..."
+            # видаляємо, а єдине batch-повідомлення просто оновлюємо.
+            try:
+                await status.delete()
+            except Exception:
+                pass
+
+            state = batch["state"]
+
+            if state == "choosing_mode":
+
+                batch_text = (
+                    "✅ <b>Відео додано в пачку.</b>\n\n"
+                    f"📦 Зараз у пачці: <b>{batch['total_received']}</b>\n\n"
+                    "Обери спосіб унікалізації.\n"
+                    "Ці налаштування застосуються "
+                    "<b>до всієї пачки</b>:"
+                )
+
+                keyboard = batch_video_mode_keyboard()
+
+            elif state == "choosing_extension":
+
+                mode_names = {
+                    "metadata": "⚡ Швидкий режим",
+                    "noise": "🎞 Легка зміна відео",
+                    "preview": "🖼 Метадані + прев’ю",
+                }
+
+                batch_text = (
+                    "✅ <b>Відео додано в пачку.</b>\n\n"
+                    f"📦 Зараз у пачці: <b>{batch['total_received']}</b>\n"
+                    f"Режим: <b>{mode_names[batch['mode']]}</b>\n\n"
+                    "Обери подовження для "
+                    "<b>всієї пачки</b>:"
+                )
+
+                keyboard = batch_extension_keyboard()
+
+            else:
+
+                extend_seconds = batch.get("extend_seconds") or 0
+
+                extend_text = (
+                    "без подовження"
+                    if extend_seconds == 0
+                    else f"+{extend_seconds} сек"
+                )
+
+                batch_text = (
+                    "⚙️ <b>Пачка обробляється...</b>\n\n"
+                    f"📚 Всього прийнято: <b>{batch['total_received']}</b>\n"
+                    f"✅ Готово: <b>{batch['processed']}</b>\n"
+                    f"⏱ Подовження: <b>{extend_text}</b>\n\n"
+                    "Нове відео додано в цю ж пачку "
+                    "з тими самими налаштуваннями."
+                )
+
+                keyboard = None
+
+            try:
+                await bot.edit_message_text(
+                    chat_id=batch["chat_id"],
+                    message_id=batch["settings_message_id"],
+                    text=batch_text,
+                    reply_markup=keyboard,
+                )
+            except Exception as e:
+                print(
+                    f"Batch status update error: {e}"
+                )
 
         return
 
@@ -2716,6 +2553,7 @@ async def on_media(message: Message):
     # =====================================================
 
     queue = get_user_queue(uid)
+
     item = {
         "id": item_id,
         "stats_id": stats_id,
@@ -2730,26 +2568,24 @@ async def on_media(message: Message):
     }
 
     queue.append(item)
+
     position = len(queue)
 
     if position == 1 and uid not in processing_users:
-        if status:
-            await status.edit_text(
-                "✅ <b>Файл додано.</b>\n\n"
-                f"Розмір: {downloaded_size:.1f} МБ\n"
-                "Зараз покажу налаштування обробки."
-            )
+        await status.edit_text(
+            "✅ <b>Файл додано.</b>\n\n"
+            f"Розмір: {downloaded_size:.1f} МБ\n"
+            "Зараз покажу налаштування обробки."
+        )
+
         await show_next_item(uid)
+
     else:
-        text = (
+        await status.edit_text(
             "✅ <b>Додано в чергу.</b>\n\n"
             f"📦 Позиція: <b>{position}</b>\n"
             f"📚 Всього в черзі: <b>{len(queue)}</b>"
         )
-        if status:
-            await status.edit_text(text)
-        else:
-            await message.answer(text)
 
 
 # =========================================================
@@ -2802,9 +2638,6 @@ async def choose_batch_video_mode(
         )
         return
 
-    batch["settings_message_sent"] = True
-    batch["settings_message_id"] = callback.message.message_id
-    batch["chat_id"] = callback.message.chat.id
     batch["mode"] = mode
     batch["state"] = "choosing_extension"
 
@@ -2821,27 +2654,18 @@ async def choose_batch_video_mode(
 
     await callback.answer()
 
-    try:
-        await callback.message.edit_text(
-            f"✅ Для всієї пачки обрано:\n"
-            f"<b>{mode_names[mode]}</b>\n\n"
-            "Тепер обери подовження.\n"
-            "Це налаштування також застосовується "
-            "<b>до всієї пачки</b>.\n\n"
-            "При +30/+60 сек останній кадр "
-            "сильно розмивається, поверх по центру йде "
-            "countdown на чорній підкладці, а доданий "
-            "відрізок залишається у тиші.",
-            reply_markup=batch_extension_keyboard(),
-        )
-    except Exception as error:
-        print(f"Could not update batch mode message: {error}")
-        fallback = await callback.message.answer(
-            f"✅ Для всієї пачки обрано: <b>{mode_names[mode]}</b>\n\n"
-            "Тепер обери подовження:",
-            reply_markup=batch_extension_keyboard(),
-        )
-        batch["settings_message_id"] = fallback.message_id
+    await callback.message.edit_text(
+        f"✅ Для всієї пачки обрано:\n"
+        f"<b>{mode_names[mode]}</b>\n\n"
+        "Тепер обери подовження.\n"
+        "Це налаштування також застосовується "
+        "<b>до всієї пачки</b>.\n\n"
+        "При +30/+60 сек останній кадр "
+        "сильно розмивається, поверх по центру йде "
+        "countdown на чорній підкладці, а доданий "
+        "відрізок залишається у тиші.",
+        reply_markup=batch_extension_keyboard(),
+    )
 
 
 # =========================================================
@@ -2895,9 +2719,6 @@ async def choose_batch_extension(
         )
         return
 
-    batch["settings_message_sent"] = True
-    batch["settings_message_id"] = callback.message.message_id
-    batch["chat_id"] = callback.message.chat.id
     batch["extend_seconds"] = extend_seconds
     batch["state"] = "processing"
 
@@ -2909,7 +2730,6 @@ async def choose_batch_extension(
     )
 
     processing_users.add(uid)
-    batch["worker_running"] = True
 
     extend_text = (
         "без подовження"
@@ -2925,102 +2745,57 @@ async def choose_batch_extension(
 
     await callback.answer()
 
-    try:
-        await callback.message.edit_text(
-            "⏳ <b>Починаю обробку пачки</b>\n\n"
-            f"Режим: <b>{mode_names[batch['mode']]}</b>\n"
-            f"Подовження: <b>{extend_text}</b>\n"
-            f"📦 Відео: <b>{batch['total_received']}</b>\n"
-            f"⬇️ Ще завантажується: <b>{batch['pending_downloads']}</b>\n\n"
-            "Файли будуть оброблятися по черзі."
-        )
-    except Exception as error:
-        print(f"Could not update batch start message: {error}")
-        try:
-            fallback = await callback.message.answer(
-                "⏳ <b>Починаю обробку пачки...</b>"
-            )
-            batch["settings_message_id"] = fallback.message_id
-        except Exception as send_error:
-            print(f"Could not send batch start message: {send_error}")
+    await callback.message.edit_text(
+        "⏳ <b>Починаю обробку пачки</b>\n\n"
+        f"Режим: <b>{mode_names[batch['mode']]}</b>\n"
+        f"Подовження: <b>{extend_text}</b>\n"
+        f"📦 Відео: <b>{batch['total_received']}</b>\n\n"
+        "Файли будуть оброблятися по черзі."
+    )
 
     # Не блокуємо обробку нових повідомлень.
     asyncio.create_task(
-        process_video_batch(uid, batch)
+        process_video_batch(uid)
     )
 
 
 async def process_video_batch(
     uid: int,
-    batch: dict,
 ):
+    batch = video_batches.get(uid)
+
+    if not batch:
+        processing_users.discard(uid)
+        return
+
     chat_id = batch["chat_id"]
     status_message_id = batch.get("settings_message_id")
 
     try:
+
         while True:
+
+            batch = video_batches.get(uid)
+
+            if not batch:
+                break
+
             files = batch["files"]
-            files.sort(key=lambda x: x.get("message_id", 0))
 
-            item = None
-            if files:
-                first_item = files[0]
-                first_message_id = first_item.get("message_id", 0)
-                earlier_download_pending = any(
-                    pending_id < first_message_id
-                    for pending_id in batch["pending_message_ids"]
-                )
+            if not files:
+                break
 
-                if not earlier_download_pending:
-                    item = files.pop(0)
+            # Порядок = порядок повідомлень у Telegram.
+            files.sort(
+                key=lambda x: x.get("message_id", 0)
+            )
 
-            if item is None:
-                if batch["pending_downloads"] > 0:
-                    # Чекаємо, поки завершиться хоча б одне завантаження.
-                    # clear() виконується без await після перевірки стану,
-                    # тому сигнал від завершення завантаження не загубиться.
-                    batch["wake_event"].clear()
-                    await batch["wake_event"].wait()
-                    continue
-
-                # Черга порожня і незавершених завантажень немає.
-                # Даємо коротке вікно, щоб наступні Telegram updates із тієї
-                # самої серії повідомлень встигли зареєструватися в цій пачці.
-                if not batch["files"]:
-                    batch["wake_event"].clear()
-                    try:
-                        await asyncio.wait_for(
-                            batch["wake_event"].wait(),
-                            timeout=BATCH_IDLE_GRACE_SECONDS,
-                        )
-                    except asyncio.TimeoutError:
-                        pass
-
-                    if batch["files"] or batch["pending_downloads"] > 0:
-                        continue
-
-                    # Закриваємо пачку синхронно до наступного await.
-                    batch["state"] = "finalizing"
-                    break
-
-                # Є готовий файл, але перед ним ще завантажується попередній.
-                batch["wake_event"].clear()
-                await batch["wake_event"].wait()
-                continue
+            item = files.pop(0)
 
             local_path = item["path"]
             mode = batch["mode"]
             extend_seconds = batch["extend_seconds"]
             stats_id = item.get("stats_id")
-
-            batch["active"] = True
-            batch["started"] += 1
-            current_number = sum(
-                1
-                for message_id in batch["received_message_ids"]
-                if message_id <= item.get("message_id", 0)
-            )
-            current_number = max(current_number, batch["started"])
 
             stats_update_operation(
                 stats_id,
@@ -3028,8 +2803,13 @@ async def process_video_batch(
                 extension_seconds=extend_seconds,
             )
 
+            current_number = (
+                batch["processed"]
+                + batch["failed"]
+                + 1
+            )
+
             total_now = batch["total_received"]
-            waiting_now = len(batch["files"]) + batch["pending_downloads"]
 
             if status_message_id:
                 try:
@@ -3039,9 +2819,7 @@ async def process_video_batch(
                         text=(
                             "⚙️ <b>Обробляю пачку...</b>\n\n"
                             f"Зараз: <b>{current_number}/{total_now}</b>\n"
-                            f"Залишилось у черзі: <b>{waiting_now}</b>\n"
-                            f"З них ще завантажується: "
-                            f"<b>{batch['pending_downloads']}</b>"
+                            f"Залишилось у черзі: <b>{len(files)}</b>"
                         ),
                     )
                 except Exception:
@@ -3057,6 +2835,7 @@ async def process_video_batch(
             processing_completed = False
 
             try:
+
                 ok, error = await process_video_file(
                     input_path=local_path,
                     output_path=out_path,
@@ -3069,6 +2848,7 @@ async def process_video_batch(
 
                 if not ok:
                     batch["failed"] += 1
+
                     stats_update_operation(
                         stats_id,
                         mode=mode,
@@ -3078,21 +2858,22 @@ async def process_video_batch(
                         error_stage="processing",
                         error_type="FFmpegError",
                     )
-                    try:
-                        await bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"❌ <b>Помилка у файлі {current_number}</b>\n\n"
-                                f"<code>{error}</code>\n\n"
-                                "Переходжу до наступного відео."
-                            ),
-                        )
-                    except Exception as send_error:
-                        print(f"Could not report processing error: {send_error}")
+
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"❌ <b>Помилка у файлі "
+                            f"{current_number}</b>\n\n"
+                            f"<code>{error}</code>\n\n"
+                            "Переходжу до наступного відео."
+                        ),
+                    )
+
                     continue
 
                 if not os.path.exists(out_path):
                     batch["failed"] += 1
+
                     stats_update_operation(
                         stats_id,
                         mode=mode,
@@ -3102,30 +2883,32 @@ async def process_video_batch(
                         error_stage="processing",
                         error_type="OutputFileMissing",
                     )
-                    try:
-                        await bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"❌ Файл {current_number}: "
-                                "FFmpeg не створив результат.\n"
-                                "Переходжу до наступного."
-                            ),
-                        )
-                    except Exception as send_error:
-                        print(f"Could not report missing output: {send_error}")
+
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"❌ Файл {current_number}: "
+                            "FFmpeg не створив результат.\n"
+                            "Переходжу до наступного."
+                        ),
+                    )
+
                     continue
 
                 output_file = FSInputFile(
                     out_path,
-                    filename=f"unique_{uuid.uuid4().hex[:8]}.mp4",
+                    filename=(
+                        f"unique_"
+                        f"{uuid.uuid4().hex[:8]}.mp4"
+                    ),
                 )
 
                 await bot.send_video(
                     chat_id=chat_id,
                     video=output_file,
                     caption=(
-                        f"✅ <b>Готово {current_number}/"
-                        f"{batch['total_received']}</b>"
+                        f"✅ <b>Готово "
+                        f"{current_number}/{batch['total_received']}</b>"
                     ),
                     supports_streaming=True,
                 )
@@ -3137,10 +2920,13 @@ async def process_video_batch(
                     processing_seconds=processing_seconds,
                     status="success",
                 )
+
                 batch["processed"] += 1
 
-            except Exception as error:
+            except Exception as e:
+
                 batch["failed"] += 1
+
                 stats_update_operation(
                     stats_id,
                     mode=mode,
@@ -3150,79 +2936,60 @@ async def process_video_batch(
                     error_stage=(
                         "upload" if processing_completed else "processing"
                     ),
-                    error_type=type(error).__name__,
+                    error_type=type(e).__name__,
                 )
-                try:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"❌ <b>Помилка у файлі {current_number}</b>\n\n"
-                            f"<code>{str(error)}</code>\n\n"
-                            "Переходжу до наступного."
-                        ),
-                    )
-                except Exception as send_error:
-                    print(f"Could not report file error: {send_error}")
+
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"❌ <b>Помилка у файлі "
+                        f"{current_number}</b>\n\n"
+                        f"<code>{str(e)}</code>\n\n"
+                        "Переходжу до наступного."
+                    ),
+                )
 
             finally:
+
                 remove_file(out_path)
                 remove_file(local_path)
-                batch["active"] = False
-                batch["wake_event"].set()
 
-        processed = batch["processed"]
-        failed = batch["failed"]
-        total = batch["total_received"]
+        batch = video_batches.get(uid)
 
-        stats_finish_batch(
-            batch_id=batch["batch_id"],
-            processed=processed,
-            failed=failed,
-            mode=batch.get("mode") or "not_selected",
-            extension_seconds=batch.get("extend_seconds") or 0,
-        )
+        if batch:
 
-        if status_message_id:
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=status_message_id,
-                    text=(
-                        "✅ <b>Пачку завершено</b>\n\n"
-                        f"Всього: <b>{total}</b>\n"
-                        f"Готово: <b>{processed}</b>\n"
-                        f"Помилок: <b>{failed}</b>"
-                    ),
-                )
-            except Exception:
-                pass
+            processed = batch["processed"]
+            failed = batch["failed"]
+            total = batch["total_received"]
 
-        if video_batches.get(uid) is batch:
+            if status_message_id:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_message_id,
+                        text=(
+                            "✅ <b>Пачку завершено</b>\n\n"
+                            f"Всього: <b>{total}</b>\n"
+                            f"Готово: <b>{processed}</b>\n"
+                            f"Помилок: <b>{failed}</b>"
+                        ),
+                    )
+                except Exception:
+                    pass
+
+            stats_finish_batch(
+                batch_id=batch["batch_id"],
+                processed=processed,
+                failed=failed,
+                mode=batch["mode"],
+                extension_seconds=batch["extend_seconds"],
+            )
+
             video_batches.pop(uid, None)
 
-    except Exception as error:
-        print(f"Video batch worker crashed for user {uid}: {error}")
-        batch["worker_running"] = False
-        # Не видаляємо пачку при неочікуваній помилці: це краще, ніж
-        # непомітно втратити файли, які ще очікують обробки.
-        try:
-            if status_message_id:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=status_message_id,
-                    text=(
-                        "⚠️ <b>Обробка пачки призупинилася через помилку.</b>\n"
-                        "Файли не видалені. Звернися до адміністратора."
-                    ),
-                )
-        except Exception:
-            pass
-
     finally:
-        batch["worker_running"] = False
-        current_batch = video_batches.get(uid)
-        if not current_batch or current_batch.get("state") != "processing":
-            processing_users.discard(uid)
+
+        processing_users.discard(uid)
 
 
 # =========================================================
@@ -3492,4 +3259,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
