@@ -812,9 +812,12 @@ user_queues: dict[int, deque] = {}
 # pending_downloads рахує також ті файли, які ще завантажуються.
 video_batches: dict[int, dict] = {}
 
-# Не даємо великій кількості паралельних завантажень перевантажити
-# локальний Telegram Bot API / Railway file server.
-DOWNLOAD_SEMAPHORE = asyncio.Semaphore(2)
+# Не обмежуємо кількість одночасних завантажень штучним семафором.
+# Це дозволяє всім відео з однієї пачки почати завантажуватися паралельно.
+# Логи active_downloads показують фактичну кількість активних завантажень.
+ACTIVE_DOWNLOADS = 0
+DOWNLOAD_GET_FILE_TIMEOUT = 45
+DOWNLOAD_MAX_ATTEMPTS = 4
 BATCH_IDLE_GRACE_SECONDS = 1.5
 
 # Користувачі, в яких зараз реально працює FFmpeg/Pillow.
@@ -1051,8 +1054,17 @@ async def access_denied(message: Message):
 # DOWNLOAD ЧЕРЕЗ LOCAL TELEGRAM BOT API
 # =========================================================
 
+def safe_error_text(error: Exception) -> str:
+    """Приховує токен бота з повідомлень і логів."""
+    text = str(error)
+    token = BOT_TOKEN.strip()
+    if token:
+        text = text.replace(token, "[BOT_TOKEN_REDACTED]")
+    return text
+
+
 def is_retryable_download_error(error: Exception) -> bool:
-    text = str(error).lower()
+    text = safe_error_text(error).lower()
 
     retry_phrases = (
         "wrong file_id",
@@ -1093,19 +1105,46 @@ def is_retryable_download_error(error: Exception) -> bool:
 async def download_telegram_file(
     file_obj,
     destination: str,
+    *,
+    user_id: int | None = None,
+    message_id: int | None = None,
 ):
-    """Завантажує файл із повторними спробами при тимчасових помилках."""
+    """Завантажує файл без штучного ліміту паралельності.
+
+    Повторює тимчасові помилки Telegram/local Bot API та файлового сервера.
+    Повний file_path не записується в логи, оскільки локальний шлях може
+    містити токен бота.
+    """
+    global ACTIVE_DOWNLOADS
 
     expected_size = int(getattr(file_obj, "file_size", 0) or 0)
-    max_attempts = 3
     last_error = None
+    download_started = time.perf_counter()
+    ACTIVE_DOWNLOADS += 1
 
-    for attempt in range(1, max_attempts + 1):
-        remove_file(destination)
+    context = (
+        f"user={user_id if user_id is not None else 'unknown'} "
+        f"message={message_id if message_id is not None else 'unknown'} "
+        f"size={expected_size}B"
+    )
 
-        try:
-            async with DOWNLOAD_SEMAPHORE:
-                telegram_file = await bot.get_file(file_obj.file_id)
+    print(
+        f"[DOWNLOAD] started ({context}); "
+        f"active_downloads={ACTIVE_DOWNLOADS}"
+    )
+
+    try:
+        for attempt in range(1, DOWNLOAD_MAX_ATTEMPTS + 1):
+            remove_file(destination)
+            attempt_started = time.perf_counter()
+
+            try:
+                # get_file має відповідати швидко. Якщо локальний API завис,
+                # обриваємо саме цей запит і повторюємо його.
+                telegram_file = await asyncio.wait_for(
+                    bot.get_file(file_obj.file_id),
+                    timeout=DOWNLOAD_GET_FILE_TIMEOUT,
+                )
                 file_path = telegram_file.file_path
 
                 if not file_path:
@@ -1113,18 +1152,19 @@ async def download_telegram_file(
                         "Telegram не повернув file_path."
                     )
 
+                is_local_path = os.path.isabs(file_path)
                 print(
-                    f"Telegram file_path (attempt {attempt}/"
-                    f"{max_attempts}): {file_path}"
+                    f"[DOWNLOAD] get_file OK ({context}); "
+                    f"attempt={attempt}/{DOWNLOAD_MAX_ATTEMPTS}; "
+                    f"path_type={'local' if is_local_path else 'remote'}"
                 )
 
-                if os.path.isabs(file_path):
+                if is_local_path:
                     root = "/var/lib/telegram-bot-api/"
 
                     if not file_path.startswith(root):
                         raise RuntimeError(
-                            "Отримано невідомий абсолютний шлях: "
-                            f"{file_path}"
+                            "Отримано невідомий абсолютний шлях від Telegram API."
                         )
 
                     relative_path = file_path[len(root):]
@@ -1134,6 +1174,7 @@ async def download_telegram_file(
                     timeout = aiohttp.ClientTimeout(
                         total=900,
                         connect=60,
+                        sock_read=120,
                     )
 
                     async with aiohttp.ClientSession(
@@ -1159,42 +1200,64 @@ async def download_telegram_file(
                         destination=destination,
                     )
 
-            if not os.path.exists(destination):
-                raise RuntimeError(
-                    "Downloaded file is missing after transfer."
+                if not os.path.exists(destination):
+                    raise RuntimeError(
+                        "Downloaded file is missing after transfer."
+                    )
+
+                actual_size = os.path.getsize(destination)
+                if actual_size <= 0:
+                    raise RuntimeError("Incomplete download: empty file.")
+
+                if expected_size and actual_size != expected_size:
+                    raise RuntimeError(
+                        "Incomplete download: expected "
+                        f"{expected_size} bytes, received {actual_size} bytes."
+                    )
+
+                elapsed = time.perf_counter() - download_started
+                print(
+                    f"[DOWNLOAD] success ({context}); "
+                    f"received={actual_size}B; "
+                    f"attempt={attempt}/{DOWNLOAD_MAX_ATTEMPTS}; "
+                    f"elapsed={elapsed:.1f}s"
                 )
+                return
 
-            actual_size = os.path.getsize(destination)
-            if actual_size <= 0:
-                raise RuntimeError("Incomplete download: empty file.")
+            except Exception as error:
+                last_error = error
+                remove_file(destination)
 
-            if expected_size and actual_size != expected_size:
-                raise RuntimeError(
-                    "Incomplete download: expected "
-                    f"{expected_size} bytes, received {actual_size} bytes."
+                retryable = is_retryable_download_error(error)
+                if attempt >= DOWNLOAD_MAX_ATTEMPTS or not retryable:
+                    elapsed = time.perf_counter() - download_started
+                    print(
+                        f"[DOWNLOAD] FAILED ({context}); "
+                        f"attempt={attempt}/{DOWNLOAD_MAX_ATTEMPTS}; "
+                        f"retryable={retryable}; elapsed={elapsed:.1f}s; "
+                        f"error={type(error).__name__}: {safe_error_text(error)}"
+                    )
+                    raise
+
+                delay = float(2 ** (attempt - 1))
+                attempt_elapsed = time.perf_counter() - attempt_started
+                print(
+                    f"[DOWNLOAD] attempt {attempt} failed ({context}); "
+                    f"after={attempt_elapsed:.1f}s; "
+                    f"retrying_in={delay:.0f}s; "
+                    f"error={type(error).__name__}: {safe_error_text(error)}"
                 )
+                await asyncio.sleep(delay)
 
-            return
+        if last_error:
+            raise last_error
 
-        except Exception as error:
-            last_error = error
-            remove_file(destination)
-
-            if (
-                attempt >= max_attempts
-                or not is_retryable_download_error(error)
-            ):
-                raise
-
-            delay = float(attempt)
-            print(
-                f"Telegram download attempt {attempt} failed: {error}. "
-                f"Retrying in {delay:.0f}s."
-            )
-            await asyncio.sleep(delay)
-
-    if last_error:
-        raise last_error
+    finally:
+        ACTIVE_DOWNLOADS = max(0, ACTIVE_DOWNLOADS - 1)
+        print(
+            f"[DOWNLOAD] task finished ({context}); "
+            f"active_downloads={ACTIVE_DOWNLOADS}"
+        )
 
 
 # =========================================================
@@ -2515,6 +2578,13 @@ async def on_media(message: Message):
             mode=video_batch.get("mode"),
             extension_seconds=video_batch.get("extend_seconds"),
         )
+        print(
+            f"[BATCH] video received user={uid} "
+            f"message={message.message_id} "
+            f"total={video_batch['total_received']} "
+            f"pending={video_batch['pending_downloads']} "
+            f"ready={len(video_batch['files'])}"
+        )
 
     status = None
     try:
@@ -2523,7 +2593,12 @@ async def on_media(message: Message):
         print(f"Could not send upload status message: {error}")
 
     try:
-        await download_telegram_file(file_obj, local_path)
+        await download_telegram_file(
+            file_obj,
+            local_path,
+            user_id=uid,
+            message_id=message.message_id,
+        )
 
         if not os.path.exists(local_path):
             raise RuntimeError("Файл не був завантажений.")
@@ -2547,11 +2622,19 @@ async def on_media(message: Message):
             video_batch["pending_message_ids"].discard(message.message_id)
             video_batch["failed"] += 1
             video_batch["wake_event"].set()
+            print(
+                f"[BATCH] video download failed user={uid} "
+                f"message={message.message_id} "
+                f"total={video_batch['total_received']} "
+                f"pending={video_batch['pending_downloads']} "
+                f"ready={len(video_batch['files'])} "
+                f"failed={video_batch['failed']}"
+            )
             finish_empty_video_batch(uid, video_batch)
 
         error_text = (
             "❌ <b>Помилка завантаження</b>\n\n"
-            f"<code>{str(error)}</code>"
+            f"<code>{safe_error_text(error)}</code>"
         )
         try:
             if status:
@@ -2600,6 +2683,13 @@ async def on_media(message: Message):
         )
         batch["pending_message_ids"].discard(message.message_id)
         batch["wake_event"].set()
+        print(
+            f"[BATCH] video ready user={uid} "
+            f"message={message.message_id} "
+            f"total={batch['total_received']} "
+            f"pending={batch['pending_downloads']} "
+            f"ready={len(batch['files'])}"
+        )
 
         stats_update_operation(
             stats_id,
