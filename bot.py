@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import random
 import sqlite3
@@ -46,8 +45,7 @@ FILE_SERVER_URL = os.getenv(
     "http://telegram-bot-api.railway.internal:8090",
 ).rstrip("/")
 
-MAX_VIDEO_MB = 100
-MAX_IMAGE_MB = 50
+MAX_FILE_MB = 50
 TMP_DIR = tempfile.gettempdir()
 STATS_DB_PATH = os.getenv("STATS_DB_PATH", "/data/bot_stats.sqlite3")
 
@@ -1436,7 +1434,7 @@ def common_reencode_filter(extra_filters: list[str]) -> str:
     return ",".join(filters)
 
 
-async def process_video_file_legacy(
+async def process_video_file(
     input_path: str,
     output_path: str,
     mode: str,
@@ -1655,396 +1653,6 @@ async def process_video_file_legacy(
     ])
 
     return await run_ffmpeg(args)
-
-
-
-async def get_video_stream_info(video_path: str) -> dict | None:
-    """Отримує параметри відеопотоку, потрібні для безпечного append без re-encode."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffprobe",
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries",
-            (
-                "stream=codec_name,width,height,pix_fmt,profile,level,"
-                "r_frame_rate,avg_frame_rate,time_base,sample_aspect_ratio,"
-                "field_order,color_range,color_space,color_transfer,color_primaries"
-            ),
-            "-of", "json",
-            video_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _stderr = await proc.communicate()
-        if proc.returncode != 0:
-            return None
-
-        payload = json.loads(stdout.decode(errors="ignore") or "{}")
-        streams = payload.get("streams") or []
-        return streams[0] if streams else None
-
-    except Exception as e:
-        print(f"ffprobe stream info error: {e}")
-        return None
-
-
-def fast_append_profile(stream: dict) -> dict | None:
-    """
-    Повертає параметри для сумісного H.264 tail-фрагмента.
-    Для нестандартних форматів використовується старий fallback.
-    """
-    if not stream:
-        return None
-
-    if stream.get("codec_name") != "h264":
-        return None
-
-    if stream.get("pix_fmt") != "yuv420p":
-        return None
-
-    if stream.get("field_order") not in (None, "unknown", "progressive"):
-        return None
-
-    width = int(stream.get("width") or 0)
-    height = int(stream.get("height") or 0)
-    if width < 2 or height < 2 or width % 2 or height % 2:
-        return None
-
-    fps = (
-        stream.get("avg_frame_rate")
-        or stream.get("r_frame_rate")
-        or ""
-    )
-    if not fps or fps in {"0/0", "N/A"}:
-        return None
-
-    try:
-        from fractions import Fraction
-        fps_value = Fraction(fps)
-        if fps_value <= 0 or fps_value > 120:
-            return None
-    except Exception:
-        return None
-
-    profile_raw = (stream.get("profile") or "").lower()
-    if "baseline" in profile_raw:
-        profile = "baseline"
-    elif profile_raw == "main":
-        profile = "main"
-    elif profile_raw == "high":
-        profile = "high"
-    else:
-        # Не намагаємося вгадувати профіль, якщо він нестандартний.
-        return None
-
-    level_value = stream.get("level")
-    level = None
-    try:
-        level_number = int(level_value)
-        if level_number > 0:
-            level = f"{level_number // 10}.{level_number % 10}"
-    except (TypeError, ValueError):
-        pass
-
-    time_base = stream.get("time_base") or ""
-    track_timescale = None
-    try:
-        denominator = int(time_base.split("/", 1)[1])
-        if 1000 <= denominator <= 1000000:
-            track_timescale = denominator
-    except (IndexError, TypeError, ValueError):
-        pass
-
-    sar = stream.get("sample_aspect_ratio") or "1:1"
-    if sar in {"N/A", "0:1", "0/1"}:
-        sar = "1:1"
-    sar = sar.replace(":", "/")
-
-    return {
-        "width": width,
-        "height": height,
-        "fps": str(fps_value),
-        "profile": profile,
-        "level": level,
-        "time_base_timescale": track_timescale,
-        "sar": sar,
-        "color_range": stream.get("color_range"),
-        "color_space": stream.get("color_space"),
-        "color_transfer": stream.get("color_transfer"),
-        "color_primaries": stream.get("color_primaries"),
-    }
-
-
-async def append_compressed_tail(
-    base_path: str,
-    output_path: str,
-    extend_seconds: int,
-) -> tuple[bool, str]:
-    """
-    Додає стиснутий заморожений фрагмент до готового відео:
-    - оригінальний відеопотік не перекодовується;
-    - додаткові 30/60 секунд кодуються окремо з високим CRF;
-    - оригінальне аудіо додається назад і не подовжується.
-    """
-    stream = await get_video_stream_info(base_path)
-    profile = fast_append_profile(stream)
-
-    if not profile:
-        return False, "Формат відео не підтримує безпечне швидке об'єднання."
-
-    duration = await get_video_duration(base_path)
-    if duration <= 0:
-        return False, "Не вдалося визначити тривалість відео."
-
-    os.makedirs(TMP_DIR, exist_ok=True)
-
-    try:
-        with tempfile.TemporaryDirectory(
-            prefix="compressed_tail_",
-            dir=TMP_DIR,
-        ) as work_dir:
-            frame_path = os.path.join(work_dir, "last_frame.png")
-            base_video_path = os.path.join(work_dir, "base_video.mp4")
-            tail_path = os.path.join(work_dir, "tail.mp4")
-            concat_list_path = os.path.join(work_dir, "concat.txt")
-            joined_video_path = os.path.join(work_dir, "joined_video.mp4")
-
-            # Витягуємо саме останній доступний кадр, не застосовуючи
-            # автоматичний поворот до закодованих розмірів відеопотоку.
-            ok, error = await run_ffmpeg([
-                "-sseof", "-1",
-                "-noautorotate",
-                "-i", base_path,
-                "-map", "0:v:0",
-                "-vf", "reverse",
-                "-frames:v", "1",
-                "-update", "1",
-                frame_path,
-            ])
-            if not ok or not os.path.exists(frame_path):
-                return False, error or "Не вдалося витягнути останній кадр."
-
-            # Оригінальний відеопотік відокремлюємо без перекодування.
-            ok, error = await run_ffmpeg([
-                "-i", base_path,
-                "-map", "0:v:0",
-                "-c:v", "copy",
-                "-an",
-                "-map_metadata", "0",
-                "-movflags", "+faststart",
-                base_video_path,
-            ])
-            if not ok:
-                return False, error
-
-            filters = [
-                f"setsar={profile['sar']}",
-                (
-                    "boxblur="
-                    "luma_radius='min(100,min(w,h)/2-1)':"
-                    "luma_power=1:"
-                    "chroma_radius='min(100,min(cw,ch)/2-1)':"
-                    "chroma_power=1"
-                ),
-                "gblur=sigma=100",
-                (
-                    "drawbox="
-                    "x=iw/2-(ih*0.19):"
-                    "y=ih/2-(ih*0.07):"
-                    "w=ih*0.38:"
-                    "h=ih*0.14:"
-                    "color=black@0.82:"
-                    "t=fill"
-                ),
-            ]
-
-            countdown_expr = (
-                "%{eif\\:"
-                f"max(0\\,{extend_seconds}-floor(t))"
-                "\\:d\\:2}"
-            )
-            filters.append(
-                (
-                    "drawtext="
-                    f"text='{countdown_expr}':"
-                    "fontcolor=white:"
-                    "fontsize=h*0.075:"
-                    "x=(w-text_w)/2:"
-                    "y=(h-text_h)/2:"
-                    "shadowcolor=black@0.40:"
-                    "shadowx=2:"
-                    "shadowy=2"
-                )
-            )
-
-            tail_args = [
-                "-loop", "1",
-                "-framerate", profile["fps"],
-                "-i", frame_path,
-                "-t", str(extend_seconds),
-                "-vf", ",".join(filters),
-                "-an",
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-tune", "stillimage",
-                "-crf", "35",
-                "-pix_fmt", "yuv420p",
-                "-profile:v", profile["profile"],
-                "-r", profile["fps"],
-                "-fps_mode", "cfr",
-            ]
-
-            if profile["level"]:
-                tail_args.extend(["-level:v", profile["level"]])
-
-            for key, option in (
-                ("color_range", "-color_range"),
-                ("color_space", "-colorspace"),
-                ("color_transfer", "-color_trc"),
-                ("color_primaries", "-color_primaries"),
-            ):
-                value = profile.get(key)
-                if value and value not in {"unknown", "N/A"}:
-                    tail_args.extend([option, value])
-
-            if profile["time_base_timescale"]:
-                tail_args.extend([
-                    "-video_track_timescale",
-                    str(profile["time_base_timescale"]),
-                ])
-
-            tail_args.extend([
-                "-movflags", "+faststart",
-                tail_path,
-            ])
-
-            ok, error = await run_ffmpeg(tail_args)
-            if not ok:
-                return False, error
-
-            # Concat demuxer об'єднує два відеопотоки без re-encode.
-            with open(concat_list_path, "w", encoding="utf-8") as file:
-                file.write(f"file '{base_video_path}'\n")
-                file.write(f"file '{tail_path}'\n")
-
-            ok, error = await run_ffmpeg([
-                "-f", "concat",
-                "-safe", "0",
-                "-i", concat_list_path,
-                "-map", "0:v:0",
-                "-c:v", "copy",
-                "-an",
-                "-movflags", "+faststart",
-                joined_video_path,
-            ])
-            if not ok:
-                return False, error
-
-            # Повертаємо оригінальне аудіо. Воно не перекодовується
-            # і, як і раніше, закінчується на кінці вихідного звуку.
-            mux_args = [
-                "-i", joined_video_path,
-                "-i", base_path,
-                "-map", "0:v:0",
-                "-map", "1:a?",
-                "-c:v", "copy",
-                "-c:a", "copy",
-                "-map_metadata", "1",
-                "-movflags", "+faststart",
-                output_path,
-            ]
-            ok, error = await run_ffmpeg(mux_args)
-            if not ok:
-                return False, error
-
-            output_duration = await get_video_duration(output_path)
-            expected_duration = duration + extend_seconds
-            if output_duration < expected_duration - 1.0:
-                return False, (
-                    "Фінальне відео має неочікувану тривалість "
-                    "після об'єднання."
-                )
-
-            return True, "ok"
-
-    except Exception as e:
-        return False, str(e)
-
-
-async def process_video_file(
-    input_path: str,
-    output_path: str,
-    mode: str,
-    extend_seconds: int,
-) -> tuple[bool, str]:
-    """
-    Для +30/+60 спочатку обробляє основне відео без подовження,
-    а потім додає окремо стиснутий фрагмент. Якщо швидке об'єднання
-    несумісне з вихідним форматом, використовує попередній FFmpeg-режим.
-    """
-    if extend_seconds <= 0:
-        return await process_video_file_legacy(
-            input_path=input_path,
-            output_path=output_path,
-            mode=mode,
-            extend_seconds=0,
-        )
-
-    # У metadata-режимі перевіряємо сумісність ДО створення проміжного
-    # файлу, щоб не витрачати час на зайвий remux для непідтримуваних кодеків.
-    if mode == "metadata":
-        original_stream = await get_video_stream_info(input_path)
-        if not fast_append_profile(original_stream):
-            return await process_video_file_legacy(
-                input_path=input_path,
-                output_path=output_path,
-                mode=mode,
-                extend_seconds=extend_seconds,
-            )
-
-    os.makedirs(TMP_DIR, exist_ok=True)
-    base_path = os.path.join(
-        TMP_DIR,
-        f"base_{uuid.uuid4().hex}.mp4",
-    )
-
-    try:
-        ok, error = await process_video_file_legacy(
-            input_path=input_path,
-            output_path=base_path,
-            mode=mode,
-            extend_seconds=0,
-        )
-        if not ok:
-            return False, error
-
-        ok, error = await append_compressed_tail(
-            base_path=base_path,
-            output_path=output_path,
-            extend_seconds=extend_seconds,
-        )
-        if ok:
-            return True, "ok"
-
-        print(
-            "Compressed tail append failed; "
-            f"using legacy full re-encode fallback: {error[-1000:]}"
-        )
-
-        return await process_video_file_legacy(
-            input_path=input_path,
-            output_path=output_path,
-            mode=mode,
-            extend_seconds=extend_seconds,
-        )
-
-    finally:
-        try:
-            if os.path.exists(base_path):
-                os.remove(base_path)
-        except OSError:
-            pass
 
 
 # =========================================================
@@ -2311,12 +1919,11 @@ async def on_media(message: Message):
 
     if file_obj.file_size:
 
-        max_file_mb = (
-            MAX_VIDEO_MB
-            if media_type == "video"
-            else MAX_IMAGE_MB
+        max_bytes = (
+            MAX_FILE_MB
+            * 1024
+            * 1024
         )
-        max_bytes = max_file_mb * 1024 * 1024
 
         if file_obj.file_size > max_bytes:
 
@@ -2336,7 +1943,7 @@ async def on_media(message: Message):
             await message.answer(
                 "❌ Файл завеликий.\n\n"
                 f"Розмір: {size_mb:.1f} МБ\n"
-                f"Максимум: {max_file_mb} МБ."
+                f"Максимум: {MAX_FILE_MB} МБ."
             )
             return
 
@@ -3193,8 +2800,8 @@ async def unsupported(
 
     await message.answer(
         "Надішли мені відео або фото.\n\n"
-        f"🎬 Відео — до {MAX_VIDEO_MB} МБ\n"
-        f"🖼 JPG / PNG / WEBP — до {MAX_IMAGE_MB} МБ\n\n"
+        "🎬 Відео — до 50 МБ\n"
+        "🖼 JPG / PNG / WEBP\n\n"
         "Можна надсилати кілька відео підряд — "
         "вони обробляться однією пачкою "
         "з однаковими налаштуваннями."
@@ -3222,8 +2829,7 @@ async def main():
         "===================================="
     )
     print(
-        f"Max video: {MAX_VIDEO_MB} MB | "
-        f"Max image: {MAX_IMAGE_MB} MB"
+        f"Max file: {MAX_FILE_MB} MB"
     )
     print(
         f"Allowed users: "
