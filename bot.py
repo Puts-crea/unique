@@ -45,7 +45,8 @@ FILE_SERVER_URL = os.getenv(
     "http://telegram-bot-api.railway.internal:8090",
 ).rstrip("/")
 
-MAX_FILE_MB = 50
+MAX_VIDEO_MB = 100
+MAX_IMAGE_MB = 50
 TMP_DIR = tempfile.gettempdir()
 STATS_DB_PATH = os.getenv("STATS_DB_PATH", "/data/bot_stats.sqlite3")
 
@@ -905,14 +906,76 @@ async def access_denied(message: Message):
 # DOWNLOAD ЧЕРЕЗ LOCAL TELEGRAM BOT API
 # =========================================================
 
+def redact_sensitive(value) -> str:
+    """Прибирає токен бота з логів та повідомлень про помилки."""
+    text = str(value)
+
+    if BOT_TOKEN:
+        text = text.replace(BOT_TOKEN, "[BOT_TOKEN]")
+        encoded_token = quote(BOT_TOKEN, safe="")
+        text = text.replace(encoded_token, "[BOT_TOKEN]")
+
+    return text
+
+
 async def download_telegram_file(
     file_obj,
     destination: str,
+    media_type: str,
 ):
+    expected_size = int(getattr(file_obj, "file_size", 0) or 0)
+    file_id = getattr(file_obj, "file_id", "") or ""
+    unique_id = getattr(file_obj, "file_unique_id", "") or ""
 
-    telegram_file = await bot.get_file(
-        file_obj.file_id
+    print(
+        "Download request: "
+        f"type={media_type}, "
+        f"size_mb={expected_size / 1024 / 1024:.2f}, "
+        f"file_id_length={len(file_id)}, "
+        f"file_unique_id={unique_id[:12] or 'unknown'}"
     )
+
+    # getFile іноді повертає тимчасову помилку локального Bot API.
+    # Обмежуємо кількість спроб, щоб файл не зависав на невизначений час.
+    telegram_file = None
+    last_error = None
+
+    for attempt in range(1, 4):
+        started = time.perf_counter()
+
+        try:
+            telegram_file = await asyncio.wait_for(
+                bot.get_file(file_id),
+                timeout=20,
+            )
+            elapsed = time.perf_counter() - started
+
+            print(
+                f"get_file success: attempt={attempt}/3, "
+                f"elapsed={elapsed:.2f}s"
+            )
+            break
+
+        except Exception as error:
+            last_error = error
+            elapsed = time.perf_counter() - started
+
+            print(
+                f"get_file failed: attempt={attempt}/3, "
+                f"elapsed={elapsed:.2f}s, "
+                f"error_type={type(error).__name__}, "
+                f"error={redact_sensitive(error)}"
+            )
+
+            if attempt < 3:
+                await asyncio.sleep(attempt * 2)
+
+    if telegram_file is None:
+        raise RuntimeError(
+            "Telegram get_file не спрацював після 3 спроб: "
+            f"{type(last_error).__name__}: "
+            f"{redact_sensitive(last_error)}"
+        ) from last_error
 
     file_path = telegram_file.file_path
 
@@ -921,7 +984,12 @@ async def download_telegram_file(
             "Telegram не повернув file_path."
         )
 
-    print(f"Telegram file_path: {file_path}")
+    print(
+        "Telegram file_path received: "
+        f"{redact_sensitive(file_path)}"
+    )
+
+    download_started = time.perf_counter()
 
     if os.path.isabs(file_path):
 
@@ -930,7 +998,7 @@ async def download_telegram_file(
         if not file_path.startswith(root):
             raise RuntimeError(
                 "Отримано невідомий абсолютний шлях: "
-                f"{file_path}"
+                f"{redact_sensitive(file_path)}"
             )
 
         relative_path = file_path[len(root):]
@@ -940,55 +1008,68 @@ async def download_telegram_file(
             safe="/",
         )
 
-        download_url = (
-            f"{FILE_SERVER_URL}/{safe_path}"
-        )
+        download_url = f"{FILE_SERVER_URL}/{safe_path}"
 
         print(
-            f"Downloading through file server: "
-            f"{download_url}"
+            "Downloading through file server: "
+            f"{redact_sensitive(download_url)}"
         )
 
         timeout = aiohttp.ClientTimeout(
-            total=900,
-            connect=60,
+            total=600,
+            connect=30,
+            sock_read=120,
         )
+
+        downloaded_bytes = 0
 
         async with aiohttp.ClientSession(
             timeout=timeout
         ) as client:
 
-            async with client.get(
-                download_url
-            ) as response:
+            async with client.get(download_url) as response:
 
                 if response.status != 200:
-
-                    text = await response.text()
+                    response_text = await response.text()
 
                     raise RuntimeError(
                         "File server error: "
                         f"HTTP {response.status}: "
-                        f"{text[:300]}"
+                        f"{redact_sensitive(response_text[:300])}"
                     )
 
-                with open(
-                    destination,
-                    "wb",
-                ) as output:
-
-                    async for chunk in (
-                        response.content.iter_chunked(
-                            1024 * 1024
-                        )
+                with open(destination, "wb") as output:
+                    async for chunk in response.content.iter_chunked(
+                        1024 * 1024
                     ):
                         output.write(chunk)
+                        downloaded_bytes += len(chunk)
 
+        elapsed = time.perf_counter() - download_started
+        print(
+            "File server download complete: "
+            f"bytes={downloaded_bytes}, "
+            f"elapsed={elapsed:.2f}s"
+        )
         return
+
+    print("Downloading through Telegram Bot API file endpoint.")
 
     await bot.download_file(
         file_path,
         destination=destination,
+    )
+
+    elapsed = time.perf_counter() - download_started
+    actual_bytes = (
+        os.path.getsize(destination)
+        if os.path.exists(destination)
+        else 0
+    )
+
+    print(
+        "Telegram file endpoint download complete: "
+        f"bytes={actual_bytes}, elapsed={elapsed:.2f}s"
     )
 
 
@@ -1590,6 +1671,13 @@ async def process_video_file(
 
     vf = common_reencode_filter(filters)
 
+    if extend_seconds > 0:
+        print(
+            "Extended video compression: "
+            f"mode={mode}, extension={extend_seconds}s, "
+            "video_codec=libx264, crf=24, preset=veryfast"
+        )
+
     args = [
         "-i",
         input_path,
@@ -1610,7 +1698,10 @@ async def process_video_file(
         "veryfast",
 
         "-crf",
-        "23" if mode == "noise" else "18",
+        (
+            "24" if extend_seconds > 0
+            else ("23" if mode == "noise" else "18")
+        ),
 
         "-pix_fmt",
         "yuv420p",
@@ -1910,6 +2001,15 @@ async def on_media(message: Message):
     item_id = uuid.uuid4().hex[:12]
     stats_id = f"{message.chat.id}:{message.message_id}"
     initial_size = int(file_obj.file_size or 0)
+
+    print(
+        "Incoming media: "
+        f"type={media_type}, "
+        f"name={original_name}, "
+        f"size_mb={initial_size / 1024 / 1024:.2f}, "
+        f"file_id_length={len(file_obj.file_id or '')}, "
+        f"file_unique_id={(file_obj.file_unique_id or '')[:12]}"
+    )
     stats_start_operation(
         event_key=stats_id,
         user_id=uid,
@@ -1917,21 +2017,17 @@ async def on_media(message: Message):
         file_size_bytes=initial_size or None,
     )
 
+    max_file_mb = (
+        MAX_VIDEO_MB if media_type == "video" else MAX_IMAGE_MB
+    )
+
     if file_obj.file_size:
 
-        max_bytes = (
-            MAX_FILE_MB
-            * 1024
-            * 1024
-        )
+        max_bytes = max_file_mb * 1024 * 1024
 
         if file_obj.file_size > max_bytes:
 
-            size_mb = (
-                file_obj.file_size
-                / 1024
-                / 1024
-            )
+            size_mb = file_obj.file_size / 1024 / 1024
 
             stats_update_operation(
                 stats_id,
@@ -1943,7 +2039,7 @@ async def on_media(message: Message):
             await message.answer(
                 "❌ Файл завеликий.\n\n"
                 f"Розмір: {size_mb:.1f} МБ\n"
-                f"Максимум: {MAX_FILE_MB} МБ."
+                f"Максимум для цього типу файлу: {max_file_mb} МБ."
             )
             return
 
@@ -1960,6 +2056,7 @@ async def on_media(message: Message):
         await download_telegram_file(
             file_obj,
             local_path,
+            media_type,
         )
 
     except Exception as e:
@@ -1975,7 +2072,7 @@ async def on_media(message: Message):
 
         await status.edit_text(
             "❌ <b>Помилка завантаження</b>\n\n"
-            f"<code>{str(e)}</code>"
+            f"<code>{redact_sensitive(e)}</code>"
         )
         return
 
@@ -2800,8 +2897,8 @@ async def unsupported(
 
     await message.answer(
         "Надішли мені відео або фото.\n\n"
-        "🎬 Відео — до 50 МБ\n"
-        "🖼 JPG / PNG / WEBP\n\n"
+        f"🎬 Відео — до {MAX_VIDEO_MB} МБ\n"
+        f"🖼 Фото — до {MAX_IMAGE_MB} МБ\n\n"
         "Можна надсилати кілька відео підряд — "
         "вони обробляться однією пачкою "
         "з однаковими налаштуваннями."
@@ -2829,7 +2926,8 @@ async def main():
         "===================================="
     )
     print(
-        f"Max file: {MAX_FILE_MB} MB"
+        f"Max video: {MAX_VIDEO_MB} MB | "
+        f"Max image: {MAX_IMAGE_MB} MB"
     )
     print(
         f"Allowed users: "
