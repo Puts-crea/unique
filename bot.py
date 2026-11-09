@@ -1,11 +1,8 @@
 import asyncio
 import os
 import random
-import sqlite3
 import tempfile
-import time
 import uuid
-from datetime import datetime, timedelta, timezone
 from collections import deque
 from pathlib import Path
 from urllib.parse import quote
@@ -45,683 +42,8 @@ FILE_SERVER_URL = os.getenv(
     "http://telegram-bot-api.railway.internal:8090",
 ).rstrip("/")
 
-MAX_VIDEO_MB = 100
-MAX_IMAGE_MB = 50
+MAX_FILE_MB = 50
 TMP_DIR = tempfile.gettempdir()
-STATS_DB_PATH = os.getenv("STATS_DB_PATH", "/data/bot_stats.sqlite3")
-
-
-
-# =========================================================
-# SQLITE STATISTICS
-# =========================================================
-
-def stats_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def stats_connect():
-    connection = sqlite3.connect(
-        STATS_DB_PATH,
-        timeout=30,
-    )
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout = 30000")
-    return connection
-
-
-def stats_init():
-    """
-    Ініціалізує базу статистики.
-    За замовчуванням файл лежить у /data — Railway Volume
-    потрібно змонтувати саме в цю папку.
-    """
-
-    global STATS_DB_PATH
-
-    def initialize(path: str):
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-
-        with sqlite3.connect(path, timeout=30) as connection:
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA synchronous=NORMAL")
-            connection.execute("PRAGMA busy_timeout=30000")
-
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    first_seen TEXT NOT NULL,
-                    last_seen TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS batches (
-                    batch_id TEXT PRIMARY KEY,
-                    user_id INTEGER NOT NULL,
-                    created_at TEXT NOT NULL,
-                    finished_at TEXT,
-                    mode TEXT,
-                    extension_seconds INTEGER,
-                    total_files INTEGER NOT NULL DEFAULT 0,
-                    processed INTEGER NOT NULL DEFAULT 0,
-                    failed INTEGER NOT NULL DEFAULT 0,
-                    status TEXT NOT NULL DEFAULT 'collecting'
-                );
-
-                CREATE TABLE IF NOT EXISTS operations (
-                    event_key TEXT PRIMARY KEY,
-                    user_id INTEGER NOT NULL,
-                    created_at TEXT NOT NULL,
-                    media_type TEXT NOT NULL,
-                    file_size_bytes INTEGER,
-                    video_duration_seconds REAL,
-                    mode TEXT,
-                    extension_seconds INTEGER,
-                    processing_seconds REAL,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    error_stage TEXT,
-                    error_type TEXT,
-                    batch_id TEXT
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_operations_created
-                    ON operations(created_at);
-                CREATE INDEX IF NOT EXISTS idx_operations_user
-                    ON operations(user_id);
-                CREATE INDEX IF NOT EXISTS idx_operations_batch
-                    ON operations(batch_id);
-                CREATE INDEX IF NOT EXISTS idx_batches_created
-                    ON batches(created_at);
-                CREATE INDEX IF NOT EXISTS idx_users_last_seen
-                    ON users(last_seen);
-                """
-            )
-
-            stale_before = (
-                datetime.now(timezone.utc) - timedelta(hours=24)
-            ).isoformat(timespec="seconds")
-
-            connection.execute(
-                """
-                UPDATE operations
-                SET status='failed',
-                    error_stage=COALESCE(error_stage, 'processing'),
-                    error_type=COALESCE(error_type, 'InterruptedAfterRestart')
-                WHERE status='pending' AND created_at < ?
-                """,
-                (stale_before,),
-            )
-
-            connection.execute(
-                """
-                UPDATE batches
-                SET status='interrupted',
-                    finished_at=COALESCE(finished_at, ?)
-                WHERE status!='finished' AND created_at < ?
-                """,
-                (
-                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                    stale_before,
-                ),
-            )
-
-    try:
-        initialize(STATS_DB_PATH)
-    except Exception as error:
-        # Не зупиняємо бота, якщо Volume ще не підключений.
-        fallback_path = "/tmp/bot_stats.sqlite3"
-        print(
-            f"WARNING: stats DB unavailable at {STATS_DB_PATH}: {error}. "
-            f"Using temporary fallback {fallback_path}"
-        )
-        STATS_DB_PATH = fallback_path
-        initialize(STATS_DB_PATH)
-
-    print(f"Statistics database: {STATS_DB_PATH}")
-
-
-def stats_touch_user(user_id: int):
-    now = stats_now()
-
-    try:
-        with stats_connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO users(user_id, first_seen, last_seen)
-                VALUES (?, ?, ?)
-                ON CONFLICT(user_id)
-                DO UPDATE SET last_seen=excluded.last_seen
-                """,
-                (user_id, now, now),
-            )
-    except Exception as error:
-        print(f"Stats user update error: {error}")
-
-
-def stats_start_operation(
-    event_key: str,
-    user_id: int,
-    media_type: str,
-    file_size_bytes: int | None = None,
-):
-    now = stats_now()
-    stats_touch_user(user_id)
-
-    try:
-        with stats_connect() as connection:
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO operations(
-                    event_key, user_id, created_at, media_type,
-                    file_size_bytes, status
-                )
-                VALUES (?, ?, ?, ?, ?, 'pending')
-                """,
-                (
-                    event_key,
-                    user_id,
-                    now,
-                    media_type,
-                    file_size_bytes,
-                ),
-            )
-    except Exception as error:
-        print(f"Stats operation start error: {error}")
-
-
-def stats_update_operation(event_key: str, **values):
-    allowed_fields = {
-        "file_size_bytes",
-        "video_duration_seconds",
-        "mode",
-        "extension_seconds",
-        "processing_seconds",
-        "status",
-        "error_stage",
-        "error_type",
-        "batch_id",
-    }
-
-    updates = {
-        key: value
-        for key, value in values.items()
-        if key in allowed_fields and value is not None
-    }
-
-    if not updates:
-        return
-
-    assignments = ", ".join(
-        f"{field}=?" for field in updates
-    )
-    parameters = list(updates.values())
-    parameters.append(event_key)
-
-    try:
-        with stats_connect() as connection:
-            connection.execute(
-                f"UPDATE operations SET {assignments} WHERE event_key=?",
-                parameters,
-            )
-    except Exception as error:
-        print(f"Stats operation update error: {error}")
-
-
-def stats_create_batch(batch_id: str, user_id: int):
-    try:
-        with stats_connect() as connection:
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO batches(
-                    batch_id, user_id, created_at, status
-                )
-                VALUES (?, ?, ?, 'collecting')
-                """,
-                (batch_id, user_id, stats_now()),
-            )
-    except Exception as error:
-        print(f"Stats batch create error: {error}")
-
-
-def stats_update_batch(
-    batch_id: str,
-    total_files: int | None = None,
-    mode: str | None = None,
-    extension_seconds: int | None = None,
-):
-    fields = {}
-    if total_files is not None:
-        fields["total_files"] = total_files
-    if mode is not None:
-        fields["mode"] = mode
-    if extension_seconds is not None:
-        fields["extension_seconds"] = extension_seconds
-
-    if not fields:
-        return
-
-    assignments = ", ".join(f"{key}=?" for key in fields)
-    values = list(fields.values()) + [batch_id]
-
-    try:
-        with stats_connect() as connection:
-            connection.execute(
-                f"UPDATE batches SET {assignments} WHERE batch_id=?",
-                values,
-            )
-    except Exception as error:
-        print(f"Stats batch update error: {error}")
-
-
-def stats_finish_batch(
-    batch_id: str,
-    processed: int,
-    failed: int,
-    mode: str,
-    extension_seconds: int,
-):
-    try:
-        with stats_connect() as connection:
-            connection.execute(
-                """
-                UPDATE batches
-                SET finished_at=?,
-                    processed=?,
-                    failed=?,
-                    mode=?,
-                    extension_seconds=?,
-                    status='finished'
-                WHERE batch_id=?
-                """,
-                (
-                    stats_now(),
-                    processed,
-                    failed,
-                    mode,
-                    extension_seconds,
-                    batch_id,
-                ),
-            )
-    except Exception as error:
-        print(f"Stats batch finish error: {error}")
-
-
-def stats_format_duration(seconds) -> str:
-    if seconds is None:
-        return "—"
-
-    total = max(0, int(seconds))
-    minutes, remainder = divmod(total, 60)
-    hours, minutes = divmod(minutes, 60)
-
-    if hours:
-        return f"{hours:02d}:{minutes:02d}:{remainder:02d}"
-    return f"{minutes:02d}:{remainder:02d}"
-
-
-def stats_period_data(period: str):
-    now = datetime.now(timezone.utc)
-
-    if period == "7d":
-        since = (now - timedelta(days=7)).isoformat(timespec="seconds")
-        label = "Останні 7 днів"
-    elif period == "30d":
-        since = (now - timedelta(days=30)).isoformat(timespec="seconds")
-        label = "Останні 30 днів"
-    else:
-        since = None
-        label = "Весь час"
-
-    where = "WHERE created_at >= ?" if since else ""
-    params = (since,) if since else ()
-
-    try:
-        with stats_connect() as connection:
-            totals = connection.execute(
-                f"""
-                SELECT
-                    COUNT(*) AS received,
-                    SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success,
-                    SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
-                    SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
-                    AVG(file_size_bytes) AS avg_size,
-                    AVG(
-                        CASE WHEN media_type='video'
-                        THEN video_duration_seconds END
-                    ) AS avg_video_duration,
-                    AVG(
-                        CASE WHEN status='success'
-                        THEN processing_seconds END
-                    ) AS avg_processing,
-                    MAX(
-                        CASE WHEN status='success'
-                        THEN processing_seconds END
-                    ) AS max_processing
-                FROM operations
-                {where}
-                """,
-                params,
-            ).fetchone()
-
-            media_rows = connection.execute(
-                f"""
-                SELECT media_type, COUNT(*) AS amount
-                FROM operations
-                {where}
-                GROUP BY media_type
-                """,
-                params,
-            ).fetchall()
-
-            mode_rows = connection.execute(
-                f"""
-                SELECT mode, COUNT(*) AS uses
-                FROM operations
-                {where + (' AND' if where else 'WHERE')} mode IS NOT NULL
-                GROUP BY mode
-                ORDER BY uses DESC
-                """,
-                params,
-            ).fetchall()
-
-            # Рахуємо саме вибори подовження: один раз на пачку,
-            # а не по одному разу на кожне відео в пачці.
-            extension_where = (
-                "WHERE created_at >= ? AND extension_seconds IS NOT NULL"
-                if since
-                else
-                "WHERE extension_seconds IS NOT NULL"
-            )
-            extension_rows = connection.execute(
-                f"""
-                SELECT extension_seconds, COUNT(*) AS uses
-                FROM batches
-                {extension_where}
-                GROUP BY extension_seconds
-                """,
-                params,
-            ).fetchall()
-
-            batch_where = "WHERE created_at >= ?" if since else ""
-            batch_data = connection.execute(
-                f"""
-                SELECT COUNT(*) AS batches, AVG(total_files) AS avg_batch_size
-                FROM batches
-                {batch_where}
-                """,
-                params,
-            ).fetchone()
-
-            if since:
-                user_data = connection.execute(
-                    """
-                    SELECT
-                        SUM(CASE WHEN last_seen >= ? THEN 1 ELSE 0 END) AS active,
-                        SUM(
-                            CASE WHEN first_seen >= ? AND last_seen >= ?
-                            THEN 1 ELSE 0 END
-                        ) AS new_users,
-                        SUM(
-                            CASE WHEN first_seen < ? AND last_seen >= ?
-                            THEN 1 ELSE 0 END
-                        ) AS returning_users
-                    FROM users
-                    """,
-                    (since, since, since, since, since),
-                ).fetchone()
-                active_users = int(user_data["active"] or 0)
-                new_users = int(user_data["new_users"] or 0)
-                returning_users = int(user_data["returning_users"] or 0)
-            else:
-                active_users = connection.execute(
-                    "SELECT COUNT(*) FROM users"
-                ).fetchone()[0]
-
-                new_users = active_users
-
-                returning_users = connection.execute(
-                    """
-                    SELECT COUNT(*) FROM (
-                        SELECT user_id
-                        FROM operations
-                        GROUP BY user_id
-                        HAVING COUNT(*) > 1
-                    )
-                    """
-                ).fetchone()[0]
-
-            error_where = (
-                "WHERE created_at >= ? AND status='failed'"
-                if since
-                else "WHERE status='failed'"
-            )
-            error_rows = connection.execute(
-                f"""
-                SELECT COALESCE(error_stage, 'інше') AS stage,
-                       COUNT(*) AS amount
-                FROM operations
-                {error_where}
-                GROUP BY error_stage
-                ORDER BY amount DESC
-                """,
-                params,
-            ).fetchall()
-
-            error_mode_rows = connection.execute(
-                f"""
-                SELECT COALESCE(mode, 'режим не вибрано') AS mode,
-                       COUNT(*) AS amount
-                FROM operations
-                {error_where}
-                GROUP BY mode
-                ORDER BY amount DESC
-                """,
-                params,
-            ).fetchall()
-
-            error_type_rows = connection.execute(
-                f"""
-                SELECT COALESCE(error_type, 'невідомо') AS error_type,
-                       COUNT(*) AS amount
-                FROM operations
-                {error_where}
-                GROUP BY error_type
-                ORDER BY amount DESC
-                LIMIT 5
-                """,
-                params,
-            ).fetchall()
-
-        received = int(totals["received"] or 0)
-        success = int(totals["success"] or 0)
-        failed = int(totals["failed"] or 0)
-        pending = int(totals["pending"] or 0)
-        completed = success + failed
-        success_rate = (success / completed * 100) if completed else 0
-
-        mode_names = {
-            "metadata": "⚡ Швидкий режим",
-            "noise": "🎞 Легка зміна відео",
-            "preview": "🖼 Метадані + прев’ю",
-            "image_metadata": "📝 Фото: метадані",
-            "image_pixels": "🖼 Фото: зміна пікселів",
-        }
-
-        mode_total = sum(int(row["uses"] or 0) for row in mode_rows)
-        mode_lines = []
-        for row in mode_rows:
-            name = mode_names.get(row["mode"], row["mode"] or "Не вибрано")
-            uses = int(row["uses"] or 0)
-            percent = uses / mode_total * 100 if mode_total else 0
-            mode_lines.append(
-                f"• {name}: <b>{uses}</b> ({percent:.1f}%)"
-            )
-
-        extension_counts = {0: 0, 30: 0, 60: 0}
-        for row in extension_rows:
-            extension_counts[int(row["extension_seconds"] or 0)] = int(
-                row["uses"] or 0
-            )
-
-        extension_total = sum(extension_counts.values())
-        extension_lines = []
-        for seconds, name in (
-            (0, "Без подовження"),
-            (30, "+30 секунд"),
-            (60, "+60 секунд"),
-        ):
-            count = extension_counts[seconds]
-            percent = count / extension_total * 100 if extension_total else 0
-            extension_lines.append(
-                f"• {name}: <b>{count}</b> ({percent:.1f}%)"
-            )
-
-        error_names = {
-            "download": "Завантаження",
-            "validation": "Перевірка файлу",
-            "processing": "Обробка",
-            "upload": "Відправлення результату",
-            "інше": "Інше",
-        }
-        error_lines = [
-            f"• {error_names.get(row['stage'], row['stage'])}: "
-            f"<b>{int(row['amount'] or 0)}</b>"
-            for row in error_rows
-        ]
-
-        error_mode_lines = [
-            f"• {mode_names.get(row['mode'], row['mode'])}: "
-            f"<b>{int(row['amount'] or 0)}</b>"
-            for row in error_mode_rows
-        ]
-
-        error_type_lines = [
-            f"• <code>{row['error_type']}</code>: "
-            f"<b>{int(row['amount'] or 0)}</b>"
-            for row in error_type_rows
-        ]
-
-        media_counts = {
-            row["media_type"]: int(row["amount"] or 0)
-            for row in media_rows
-        }
-
-        avg_size_mb = (
-            float(totals["avg_size"]) / 1024 / 1024
-            if totals["avg_size"] is not None else None
-        )
-
-        avg_duration = totals["avg_video_duration"]
-        avg_processing = totals["avg_processing"]
-        max_processing = totals["max_processing"]
-
-        batch_count = int(batch_data["batches"] or 0)
-        avg_batch_size = batch_data["avg_batch_size"]
-
-        user_lines = (
-            [
-                f"👥 Активних користувачів: <b>{active_users}</b>",
-                f"🆕 Нових за період: <b>{new_users}</b>",
-                f"🔁 Повернулися: <b>{returning_users}</b>",
-            ]
-            if since
-            else [
-                f"👥 Користувачів за весь час: <b>{active_users}</b>",
-                f"🔁 Повторно користувалися: <b>{returning_users}</b>",
-            ]
-        )
-
-        lines = [
-            f"📊 <b>Статистика — {label}</b>",
-            "",
-            f"📥 Отримано файлів: <b>{received}</b>",
-            f"🎬 Відео: <b>{media_counts.get('video', 0)}</b>",
-            f"🖼 Фото: <b>{media_counts.get('image', 0)}</b>",
-            f"✅ Успішно: <b>{success}</b>",
-            f"❌ Помилок: <b>{failed}</b>",
-            f"⏳ У процесі: <b>{pending}</b>",
-            f"🎯 Успішність: <b>{success_rate:.1f}%</b>",
-            "",
-            f"📦 Пачок: <b>{batch_count}</b>",
-            (
-                "📚 Середній розмір пачки: "
-                f"<b>{float(avg_batch_size):.1f}</b> відео"
-                if avg_batch_size is not None
-                else "📚 Середній розмір пачки: —"
-            ),
-            "",
-            *user_lines,
-            "",
-            "<b>Популярність режимів:</b>",
-            *(mode_lines or ["• Поки немає даних"]),
-            "",
-            "<b>Вибір подовження (пачки):</b>",
-            *extension_lines,
-            "",
-            "<b>Продуктивність:</b>",
-            (
-                f"⏱ Середній час обробки: "
-                f"<b>{float(avg_processing):.1f} с</b>"
-                if avg_processing is not None
-                else "⏱ Середній час обробки: —"
-            ),
-            (
-                f"🚀 Найдовша обробка: "
-                f"<b>{float(max_processing):.1f} с</b>"
-                if max_processing is not None
-                else "🚀 Найдовша обробка: —"
-            ),
-            (
-                f"📦 Середній розмір файлу: "
-                f"<b>{avg_size_mb:.2f} МБ</b>"
-                if avg_size_mb is not None
-                else "📦 Середній розмір файлу: —"
-            ),
-            (
-                f"🎬 Середня тривалість відео: "
-                f"<b>{stats_format_duration(avg_duration)}</b>"
-            ),
-            "",
-            "<b>Помилки за етапами:</b>",
-            *(error_lines or ["• Помилок немає"]),
-            "",
-            "<b>Помилки за режимами:</b>",
-            *(error_mode_lines or ["• Помилок немає"]),
-            "",
-            "<b>Типи помилок:</b>",
-            *(error_type_lines or ["• Помилок немає"]),
-        ]
-
-        return "\n".join(lines)
-
-    except Exception as error:
-        print(f"Stats report error: {error}")
-        return (
-            "❌ Не вдалося прочитати статистику.\n\n"
-            f"<code>{type(error).__name__}</code>"
-        )
-
-
-def stats_period_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="7 днів",
-                    callback_data="stats|7d",
-                ),
-                InlineKeyboardButton(
-                    text="30 днів",
-                    callback_data="stats|30d",
-                ),
-                InlineKeyboardButton(
-                    text="Весь час",
-                    callback_data="stats|all",
-                ),
-            ]
-        ]
-    )
-
 
 
 # =========================================================
@@ -821,7 +143,6 @@ def get_video_batch(user_id: int, chat_id: int | None = None) -> dict:
     if batch is None:
         batch = {
             "files": [],
-            "batch_id": uuid.uuid4().hex,
             "mode": None,
             "extend_seconds": None,
             "state": "choosing_mode",
@@ -906,80 +227,14 @@ async def access_denied(message: Message):
 # DOWNLOAD ЧЕРЕЗ LOCAL TELEGRAM BOT API
 # =========================================================
 
-def redact_sensitive(value) -> str:
-    """Прибирає токен бота з логів та повідомлень про помилки."""
-    text = str(value)
-
-    if BOT_TOKEN:
-        text = text.replace(BOT_TOKEN, "[BOT_TOKEN]")
-        encoded_token = quote(BOT_TOKEN, safe="")
-        text = text.replace(encoded_token, "[BOT_TOKEN]")
-
-    return text
-
-
 async def download_telegram_file(
     file_obj,
     destination: str,
-    media_type: str,
 ):
-    expected_size = int(getattr(file_obj, "file_size", 0) or 0)
-    file_id = getattr(file_obj, "file_id", "") or ""
-    unique_id = getattr(file_obj, "file_unique_id", "") or ""
 
-    print(
-        "Download request: "
-        f"type={media_type}, "
-        f"size_mb={expected_size / 1024 / 1024:.2f}, "
-        f"file_id_length={len(file_id)}, "
-        f"file_unique_id={unique_id[:12] or 'unknown'}"
+    telegram_file = await bot.get_file(
+        file_obj.file_id
     )
-
-    # getFile іноді повертає тимчасову помилку локального Bot API.
-    # Обмежуємо кількість спроб, щоб файл не зависав на невизначений час.
-    telegram_file = None
-    last_error = None
-
-    for attempt in range(1, 4):
-        started = time.perf_counter()
-
-        try:
-            # Великі відео через Local Bot API можуть потребувати
-            # більше 20 секунд, перш ніж getFile поверне локальний шлях.
-            # AiohttpSession має загальний timeout 600 секунд; цей ліміт
-            # не повинен обривати запит завчасно.
-            telegram_file = await asyncio.wait_for(
-                bot.get_file(file_id),
-                timeout=180,
-            )
-            elapsed = time.perf_counter() - started
-
-            print(
-                f"get_file success: attempt={attempt}/3, "
-                f"elapsed={elapsed:.2f}s"
-            )
-            break
-
-        except Exception as error:
-            last_error = error
-            elapsed = time.perf_counter() - started
-
-            print(
-                f"get_file failed: attempt={attempt}/3, "
-                f"elapsed={elapsed:.2f}s, "
-                f"error_type={type(error).__name__}, "
-                f"error={redact_sensitive(error)}"
-            )
-
-            if attempt < 3:
-                await asyncio.sleep(attempt * 2)
-
-    if telegram_file is None:
-        raise RuntimeError(
-            "Telegram get_file не спрацював після 3 спроб: "
-            f"{type(last_error).__name__}: "
-            f"{redact_sensitive(last_error)}"
-        ) from last_error
 
     file_path = telegram_file.file_path
 
@@ -988,12 +243,7 @@ async def download_telegram_file(
             "Telegram не повернув file_path."
         )
 
-    print(
-        "Telegram file_path received: "
-        f"{redact_sensitive(file_path)}"
-    )
-
-    download_started = time.perf_counter()
+    print(f"Telegram file_path: {file_path}")
 
     if os.path.isabs(file_path):
 
@@ -1002,7 +252,7 @@ async def download_telegram_file(
         if not file_path.startswith(root):
             raise RuntimeError(
                 "Отримано невідомий абсолютний шлях: "
-                f"{redact_sensitive(file_path)}"
+                f"{file_path}"
             )
 
         relative_path = file_path[len(root):]
@@ -1012,68 +262,55 @@ async def download_telegram_file(
             safe="/",
         )
 
-        download_url = f"{FILE_SERVER_URL}/{safe_path}"
+        download_url = (
+            f"{FILE_SERVER_URL}/{safe_path}"
+        )
 
         print(
-            "Downloading through file server: "
-            f"{redact_sensitive(download_url)}"
+            f"Downloading through file server: "
+            f"{download_url}"
         )
 
         timeout = aiohttp.ClientTimeout(
-            total=600,
-            connect=30,
-            sock_read=120,
+            total=900,
+            connect=60,
         )
-
-        downloaded_bytes = 0
 
         async with aiohttp.ClientSession(
             timeout=timeout
         ) as client:
 
-            async with client.get(download_url) as response:
+            async with client.get(
+                download_url
+            ) as response:
 
                 if response.status != 200:
-                    response_text = await response.text()
+
+                    text = await response.text()
 
                     raise RuntimeError(
                         "File server error: "
                         f"HTTP {response.status}: "
-                        f"{redact_sensitive(response_text[:300])}"
+                        f"{text[:300]}"
                     )
 
-                with open(destination, "wb") as output:
-                    async for chunk in response.content.iter_chunked(
-                        1024 * 1024
+                with open(
+                    destination,
+                    "wb",
+                ) as output:
+
+                    async for chunk in (
+                        response.content.iter_chunked(
+                            1024 * 1024
+                        )
                     ):
                         output.write(chunk)
-                        downloaded_bytes += len(chunk)
 
-        elapsed = time.perf_counter() - download_started
-        print(
-            "File server download complete: "
-            f"bytes={downloaded_bytes}, "
-            f"elapsed={elapsed:.2f}s"
-        )
         return
-
-    print("Downloading through Telegram Bot API file endpoint.")
 
     await bot.download_file(
         file_path,
         destination=destination,
-    )
-
-    elapsed = time.perf_counter() - download_started
-    actual_bytes = (
-        os.path.getsize(destination)
-        if os.path.exists(destination)
-        else 0
-    )
-
-    print(
-        "Telegram file endpoint download complete: "
-        f"bytes={actual_bytes}, elapsed={elapsed:.2f}s"
     )
 
 
@@ -1675,13 +912,6 @@ async def process_video_file(
 
     vf = common_reencode_filter(filters)
 
-    if extend_seconds > 0:
-        print(
-            "Extended video compression: "
-            f"mode={mode}, extension={extend_seconds}s, "
-            "video_codec=libx264, crf=24, preset=veryfast"
-        )
-
     args = [
         "-i",
         input_path,
@@ -1702,10 +932,7 @@ async def process_video_file(
         "veryfast",
 
         "-crf",
-        (
-            "24" if extend_seconds > 0
-            else ("23" if mode == "noise" else "18")
-        ),
+        "23" if mode == "noise" else "18",
 
         "-pix_fmt",
         "yuv420p",
@@ -1830,51 +1057,6 @@ async def cmd_broadcast(message: Message):
 
 
 # =========================================================
-# /STATS — ТІЛЬКИ ДЛЯ АДМІНІВ
-# =========================================================
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message):
-    uid = message.from_user.id
-
-    if uid not in ADMIN_USERS:
-        return
-
-    await message.answer(
-        stats_period_data("7d"),
-        reply_markup=stats_period_keyboard(),
-    )
-
-
-@dp.callback_query(F.data.startswith("stats|"))
-async def choose_stats_period(callback: CallbackQuery):
-    uid = callback.from_user.id
-
-    if uid not in ADMIN_USERS:
-        await callback.answer(
-            "Ця статистика доступна тільки адміністратору.",
-            show_alert=True,
-        )
-        return
-
-    try:
-        _, period = callback.data.split("|", 1)
-    except ValueError:
-        await callback.answer("Некоректний період.", show_alert=True)
-        return
-
-    if period not in {"7d", "30d", "all"}:
-        await callback.answer("Невідомий період.", show_alert=True)
-        return
-
-    await callback.answer()
-    await callback.message.edit_text(
-        stats_period_data(period),
-        reply_markup=stats_period_keyboard(),
-    )
-
-
-# =========================================================
 # /START
 # =========================================================
 
@@ -1886,8 +1068,6 @@ async def cmd_start(message: Message):
     ):
         await access_denied(message)
         return
-
-    stats_touch_user(message.from_user.id)
 
     await message.answer(
         "👋 <b>Унікалізатор готовий</b>\n\n"
@@ -2002,50 +1182,30 @@ async def on_media(message: Message):
     if not file_obj:
         return
 
-    item_id = uuid.uuid4().hex[:12]
-    stats_id = f"{message.chat.id}:{message.message_id}"
-    initial_size = int(file_obj.file_size or 0)
-
-    print(
-        "Incoming media: "
-        f"type={media_type}, "
-        f"name={original_name}, "
-        f"size_mb={initial_size / 1024 / 1024:.2f}, "
-        f"file_id_length={len(file_obj.file_id or '')}, "
-        f"file_unique_id={(file_obj.file_unique_id or '')[:12]}"
-    )
-    stats_start_operation(
-        event_key=stats_id,
-        user_id=uid,
-        media_type=media_type,
-        file_size_bytes=initial_size or None,
-    )
-
-    max_file_mb = (
-        MAX_VIDEO_MB if media_type == "video" else MAX_IMAGE_MB
-    )
-
     if file_obj.file_size:
 
-        max_bytes = max_file_mb * 1024 * 1024
+        max_bytes = (
+            MAX_FILE_MB
+            * 1024
+            * 1024
+        )
 
         if file_obj.file_size > max_bytes:
 
-            size_mb = file_obj.file_size / 1024 / 1024
-
-            stats_update_operation(
-                stats_id,
-                status="failed",
-                error_stage="validation",
-                error_type="FileTooLarge",
+            size_mb = (
+                file_obj.file_size
+                / 1024
+                / 1024
             )
 
             await message.answer(
                 "❌ Файл завеликий.\n\n"
                 f"Розмір: {size_mb:.1f} МБ\n"
-                f"Максимум для цього типу файлу: {max_file_mb} МБ."
+                f"Максимум: {MAX_FILE_MB} МБ."
             )
             return
+
+    item_id = uuid.uuid4().hex[:12]
 
     local_path = os.path.join(
         TMP_DIR,
@@ -2060,50 +1220,29 @@ async def on_media(message: Message):
         await download_telegram_file(
             file_obj,
             local_path,
-            media_type,
         )
 
     except Exception as e:
 
         remove_file(local_path)
 
-        stats_update_operation(
-            stats_id,
-            status="failed",
-            error_stage="download",
-            error_type=type(e).__name__,
-        )
-
         await status.edit_text(
             "❌ <b>Помилка завантаження</b>\n\n"
-            f"<code>{redact_sensitive(e)}</code>"
+            f"<code>{str(e)}</code>"
         )
         return
 
     if not os.path.exists(local_path):
-
-        stats_update_operation(
-            stats_id,
-            status="failed",
-            error_stage="download",
-            error_type="DownloadedFileMissing",
-        )
 
         await status.edit_text(
             "❌ Файл не був завантажений."
         )
         return
 
-    actual_size_bytes = os.path.getsize(local_path)
     downloaded_size = (
-        actual_size_bytes
+        os.path.getsize(local_path)
         / 1024
         / 1024
-    )
-
-    stats_update_operation(
-        stats_id,
-        file_size_bytes=actual_size_bytes,
     )
 
     print(
@@ -2122,19 +1261,8 @@ async def on_media(message: Message):
             message.chat.id,
         )
 
-        stats_create_batch(batch["batch_id"], uid)
-        stats_update_operation(
-            stats_id,
-            batch_id=batch["batch_id"],
-            video_duration_seconds=(
-                await get_video_duration(local_path)
-            ) or None,
-        )
-
         item = {
             "id": item_id,
-            "stats_id": stats_id,
-            "file_size_bytes": actual_size_bytes,
             "path": local_path,
             "type": "video",
             "original_name": original_name,
@@ -2151,13 +1279,6 @@ async def on_media(message: Message):
         )
 
         batch["total_received"] += 1
-
-        stats_update_batch(
-            batch_id=batch["batch_id"],
-            total_files=batch["total_received"],
-            mode=batch.get("mode"),
-            extension_seconds=batch.get("extend_seconds"),
-        )
 
         count = len(batch["files"])
 
@@ -2264,8 +1385,6 @@ async def on_media(message: Message):
 
     item = {
         "id": item_id,
-        "stats_id": stats_id,
-        "file_size_bytes": actual_size_bytes,
         "path": local_path,
         "type": media_type,
         "original_name": original_name,
@@ -2349,11 +1468,6 @@ async def choose_batch_video_mode(
     batch["mode"] = mode
     batch["state"] = "choosing_extension"
 
-    stats_update_batch(
-        batch_id=batch["batch_id"],
-        mode=mode,
-    )
-
     mode_names = {
         "metadata": "⚡ Швидкий режим",
         "noise": "🎞 Легка зміна відео",
@@ -2430,13 +1544,6 @@ async def choose_batch_extension(
     batch["extend_seconds"] = extend_seconds
     batch["state"] = "processing"
 
-    stats_update_batch(
-        batch_id=batch["batch_id"],
-        total_files=batch["total_received"],
-        mode=batch["mode"],
-        extension_seconds=extend_seconds,
-    )
-
     processing_users.add(uid)
 
     extend_text = (
@@ -2503,13 +1610,6 @@ async def process_video_batch(
             local_path = item["path"]
             mode = batch["mode"]
             extend_seconds = batch["extend_seconds"]
-            stats_id = item.get("stats_id")
-
-            stats_update_operation(
-                stats_id,
-                mode=mode,
-                extension_seconds=extend_seconds,
-            )
 
             current_number = (
                 batch["processed"]
@@ -2538,10 +1638,6 @@ async def process_video_batch(
                 f"output_{uid}_{uuid.uuid4().hex}.mp4"
             )
 
-            processing_started = time.perf_counter()
-            processing_seconds = 0.0
-            processing_completed = False
-
             try:
 
                 ok, error = await process_video_file(
@@ -2551,21 +1647,8 @@ async def process_video_batch(
                     extend_seconds=extend_seconds,
                 )
 
-                processing_seconds = time.perf_counter() - processing_started
-                processing_completed = bool(ok)
-
                 if not ok:
                     batch["failed"] += 1
-
-                    stats_update_operation(
-                        stats_id,
-                        mode=mode,
-                        extension_seconds=extend_seconds,
-                        processing_seconds=processing_seconds,
-                        status="failed",
-                        error_stage="processing",
-                        error_type="FFmpegError",
-                    )
 
                     await bot.send_message(
                         chat_id=chat_id,
@@ -2581,16 +1664,6 @@ async def process_video_batch(
 
                 if not os.path.exists(out_path):
                     batch["failed"] += 1
-
-                    stats_update_operation(
-                        stats_id,
-                        mode=mode,
-                        extension_seconds=extend_seconds,
-                        processing_seconds=processing_seconds,
-                        status="failed",
-                        error_stage="processing",
-                        error_type="OutputFileMissing",
-                    )
 
                     await bot.send_message(
                         chat_id=chat_id,
@@ -2621,31 +1694,11 @@ async def process_video_batch(
                     supports_streaming=True,
                 )
 
-                stats_update_operation(
-                    stats_id,
-                    mode=mode,
-                    extension_seconds=extend_seconds,
-                    processing_seconds=processing_seconds,
-                    status="success",
-                )
-
                 batch["processed"] += 1
 
             except Exception as e:
 
                 batch["failed"] += 1
-
-                stats_update_operation(
-                    stats_id,
-                    mode=mode,
-                    extension_seconds=extend_seconds,
-                    processing_seconds=processing_seconds,
-                    status="failed",
-                    error_stage=(
-                        "upload" if processing_completed else "processing"
-                    ),
-                    error_type=type(e).__name__,
-                )
 
                 await bot.send_message(
                     chat_id=chat_id,
@@ -2684,14 +1737,6 @@ async def process_video_batch(
                     )
                 except Exception:
                     pass
-
-            stats_finish_batch(
-                batch_id=batch["batch_id"],
-                processed=processed,
-                failed=failed,
-                mode=batch["mode"],
-                extension_seconds=batch["extend_seconds"],
-            )
 
             video_batches.pop(uid, None)
 
@@ -2751,24 +1796,10 @@ async def process_image(
     item["status"] = "processing"
     processing_users.add(uid)
 
-    stats_id = item.get("stats_id")
-    stats_mode = (
-        "image_metadata" if mode == "metadata" else "image_pixels"
-    )
-    stats_update_operation(
-        stats_id,
-        mode=stats_mode,
-        extension_seconds=0,
-    )
-
     await callback.answer()
 
     local_path = item["path"]
     out_path = None
-    processing_started = time.perf_counter()
-    processing_seconds = 0.0
-    processing_completed = False
-    stats_recorded = False
 
     try:
         with Image.open(local_path) as img:
@@ -2809,21 +1840,7 @@ async def process_image(
                 out_path,
             )
 
-        processing_seconds = time.perf_counter() - processing_started
-        processing_completed = bool(ok)
-
         if not ok:
-
-            stats_update_operation(
-                stats_id,
-                mode=stats_mode,
-                extension_seconds=0,
-                processing_seconds=processing_seconds,
-                status="failed",
-                error_stage="processing",
-                error_type="ImageProcessingError",
-            )
-            stats_recorded = True
 
             await callback.message.edit_text(
                 "❌ Помилка:\n\n"
@@ -2845,31 +1862,9 @@ async def process_image(
             caption="✅ <b>Готово!</b>",
         )
 
-        stats_update_operation(
-            stats_id,
-            mode=stats_mode,
-            extension_seconds=0,
-            processing_seconds=processing_seconds,
-            status="success",
-        )
-        stats_recorded = True
-
         await callback.message.delete()
 
     except Exception as e:
-
-        if not stats_recorded:
-            stats_update_operation(
-                stats_id,
-                mode=stats_mode,
-                extension_seconds=0,
-                processing_seconds=processing_seconds,
-                status="failed",
-                error_stage=(
-                    "upload" if processing_completed else "processing"
-                ),
-                error_type=type(e).__name__,
-            )
 
         await callback.message.edit_text(
             "❌ <b>Помилка</b>\n\n"
@@ -2901,8 +1896,8 @@ async def unsupported(
 
     await message.answer(
         "Надішли мені відео або фото.\n\n"
-        f"🎬 Відео — до {MAX_VIDEO_MB} МБ\n"
-        f"🖼 Фото — до {MAX_IMAGE_MB} МБ\n\n"
+        "🎬 Відео — до 50 МБ\n"
+        "🖼 JPG / PNG / WEBP\n\n"
         "Можна надсилати кілька відео підряд — "
         "вони обробляться однією пачкою "
         "з однаковими налаштуваннями."
@@ -2920,8 +1915,6 @@ async def main():
             "BOT_TOKEN не встановлений."
         )
 
-    stats_init()
-
     print(
         "===================================="
     )
@@ -2930,8 +1923,7 @@ async def main():
         "===================================="
     )
     print(
-        f"Max video: {MAX_VIDEO_MB} MB | "
-        f"Max image: {MAX_IMAGE_MB} MB"
+        f"Max file: {MAX_FILE_MB} MB"
     )
     print(
         f"Allowed users: "
