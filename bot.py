@@ -944,9 +944,13 @@ async def download_telegram_file(
         started = time.perf_counter()
 
         try:
+            # Великі відео через Local Bot API можуть потребувати
+            # більше 20 секунд, перш ніж getFile поверне локальний шлях.
+            # AiohttpSession має загальний timeout 600 секунд; цей ліміт
+            # не повинен обривати запит завчасно.
             telegram_file = await asyncio.wait_for(
                 bot.get_file(file_id),
-                timeout=20,
+                timeout=180,
             )
             elapsed = time.perf_counter() - started
 
